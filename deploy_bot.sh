@@ -1,6 +1,6 @@
 #!/bin/bash
 
-cd /root/bots/PhantomVPN_bot/
+cd /root/bots/VPN_bot/
 
 # ✅ ТОЛЬКО aiogram! Остальное встроенное
 cat > requirements.txt << EOF
@@ -24,13 +24,13 @@ CMD ["python", "main.py"]
 EOF
 
 # Собери и запусти
-sudo docker build -t phantomvpn_bot .
-sudo docker rm -f phantomvpn_bot || true
+sudo docker build -t vpn_bot .
+sudo docker rm -f vpn_bot || true
 sudo docker run -d \
-  --name phantomvpn_bot \
+  --name vpn_bot \
   --restart always \
-  -v /root/bots/PhantomVPN_bot:/app  \
-  phantomvpn_bot
+  -v /root/bots/VPN_bot:/app  \
+  vpn_bot
 
 echo "✅ Готово!"
-echo "Логи: sudo docker logs -f phantomvpn_bot"
+echo "Логи: sudo docker logs -f vpn_bot"
