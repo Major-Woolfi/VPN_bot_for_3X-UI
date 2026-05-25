@@ -1,0 +1,4 @@
+logs/
+data/users.db
+data/await_payments.json
+.env

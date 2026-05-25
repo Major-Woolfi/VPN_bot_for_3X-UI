@@ -52,15 +52,14 @@ Telegram‑бот для продажи и управления VPN‑подпи
 
 ## 📁 Структура проекта
 
-```
-.
+```plaintext
 ├── main.py
 ├── data/
 │   ├── tarifs.json
 │   ├── users.db              # создаётся при запуске
 │   └── await_payments.json   # создаётся при запуске
 ├── logs/                     # создаётся при запуске
-│   └── YYYY-MM-DD.log
+│   └── YYYY-MM-DD.log        # логи по датам
 ├── .env
 ├── requirements.txt
 ├── Dockerfile

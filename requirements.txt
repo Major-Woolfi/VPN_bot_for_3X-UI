@@ -3,3 +3,4 @@ aiohttp>=3.9
 aiosqlite>=0.19
 aiofiles>=23.2
 python-dotenv>=1.0
+paramiko>=3.0
