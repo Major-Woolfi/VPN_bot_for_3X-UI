@@ -2,7 +2,6 @@
 
 cd /root/bots/VPN_bot/
 
-# ✅ ТОЛЬКО aiogram! Остальное встроенное
 cat > requirements.txt << EOF
 aiogram
 aiohttp
