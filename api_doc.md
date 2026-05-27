@@ -1847,3 +1847,9 @@ Instructs the UI to re-fetch a resource. Fired when another admin session modifi
 
 #### Response
 
+```json
+{
+  "type": "invalidate",
+  "resource": "inbounds"
+}
+```
