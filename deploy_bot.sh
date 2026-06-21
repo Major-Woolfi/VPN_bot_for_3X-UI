@@ -1,35 +1,9 @@
 #!/bin/bash
 
-cd /root/bots/VPN_bot/
+cd /root/bots/VPN_bot_for_3X-UI/ || exit 1
 
-cat > requirements.txt << EOF
-aiogram
-aiohttp
-aiosqlite
-aiofiles
-python-dotenv
-paramiko
-EOF
+docker build -t vpn_bot .
+docker rm -f vpn_bot 2>/dev/null || true
+docker run -d --name vpn_bot --restart always -v "$(pwd)":/app vpn_bot
 
-# ✅ Правильный Dockerfile
-cat > Dockerfile << EOF
-FROM python:3.13.9
-WORKDIR /app
-COPY requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt
-COPY main.py .
-COPY data ./data
-CMD ["python", "main.py"]
-EOF
-
-# Собери и запусти
-sudo docker build -t vpn_bot .
-sudo docker rm -f vpn_bot || true
-sudo docker run -d \
-  --name vpn_bot \
-  --restart always \
-  -v /root/bots/VPN_bot:/app  \
-  vpn_bot
-
-echo "✅ Готово!"
-echo "Логи: sudo docker logs -f vpn_bot"
+echo "✅ Deployed! Logs: docker logs -f vpn_bot"
