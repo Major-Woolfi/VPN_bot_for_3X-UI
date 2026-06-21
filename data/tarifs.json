@@ -13,6 +13,13 @@
       "name": "Финляндия",
       "label": "🇫🇮 FI",
       "price_per_day_rub": 5
+    },
+    {
+      "code": "SE",
+      "flag": "🇸🇪",
+      "name": "Швеция",
+      "label": "🇸🇪 SE",
+      "price_per_day_rub": 5
     }
   ],
   "plans": [
@@ -23,40 +30,40 @@
       "ip_limit": 1,
       "traffic_gb": 10,
       "duration_days": 3,
-      "servers": ["NL"],
+      "servers": [ "NL", "FI", "SE" ],
       "active": true,
       "sort": 1
     },
     {
-      "id": "basic",
-      "name": "Базовый",
+      "id": "minimal",
+      "name": "Минимальный",
       "price_rub": 50,
       "ip_limit": 2,
-      "traffic_gb": 50,
+      "traffic_gb": 30,
       "duration_days": 30,
-      "servers": ["NL"],
+      "servers": [ "NL" ],
       "active": true,
       "sort": 2
     },
     {
-      "id": "standard",
-      "name": "Стандарт",
+      "id": "basic",
+      "name": "Базовый",
       "price_rub": 100,
-      "ip_limit": 5,
-      "traffic_gb": 200,
+      "ip_limit": 4,
+      "traffic_gb": 128,
       "duration_days": 30,
-      "servers": ["NL", "FI"],
+      "servers": [ "NL", "FI" ],
       "active": true,
       "sort": 3
     },
     {
-      "id": "standard_plus",
-      "name": "Стандарт+",
+      "id": "standart",
+      "name": "Стандарт",
       "price_rub": 200,
-      "ip_limit": 5,
-      "traffic_gb": 1024,
+      "ip_limit": 7,
+      "traffic_gb": 256,
       "duration_days": 30,
-      "servers": ["NL", "FI"],
+      "servers": [ "NL", "FI", "SE" ],
       "active": true,
       "sort": 4
     },
@@ -64,10 +71,10 @@
       "id": "premium",
       "name": "Премиум",
       "price_rub": 500,
-      "ip_limit": 15,
-      "traffic_gb": 3072,
+      "ip_limit": 10,
+      "traffic_gb": 1024,
       "duration_days": 30,
-      "servers": ["NL", "FI"],
+      "servers": [ "NL", "FI", "SE" ],
       "active": true,
       "sort": 5
     }

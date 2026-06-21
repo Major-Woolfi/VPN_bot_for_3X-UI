@@ -3,18 +3,20 @@ import html
 import json
 import logging
 import os
+import paramiko
 import re
 import secrets
 import string
 import sys
 import time
 import uuid
+import math
 from datetime import datetime, timedelta
+from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
-from urllib.parse import quote
+from urllib.parse import quote, urlencode
 
 import aiofiles
-import paramiko
 import aiohttp
 import aiosqlite
 from aiogram import Bot, Dispatcher, Router, F
@@ -36,6 +38,64 @@ from dotenv import load_dotenv
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 load_dotenv(os.path.join(BASE_DIR, ".env"))
+
+DEFAULT_LANGUAGE = os.getenv("DEFAULT_LANGUAGE", "ru").strip().lower()
+LANGS_DIR = Path(os.getenv("LANGS_DIR", os.path.join(BASE_DIR, "langs")))
+
+
+def load_languages() -> Dict[str, Dict[str, Any]]:
+    languages: Dict[str, Dict[str, Any]] = {}
+    if not LANGS_DIR.exists():
+        return languages
+
+    for path in sorted(LANGS_DIR.glob("*.json")):
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+        except Exception:
+            continue
+        code = (
+            str(data.get("meta", {}).get("code", path.stem)).strip().lower()
+            or path.stem
+        )
+        languages[code] = data
+
+    return languages
+
+
+def get_available_languages() -> List[str]:
+    return list(load_languages().keys())
+
+
+def get_language_display_name(code: str) -> str:
+    data = load_languages().get(code, {})
+    return str(data.get("meta", {}).get("name", code)).strip() or code
+
+
+def _resolve_key(data: Dict[str, Any], key: str) -> Optional[Any]:
+    node: Any = data
+    for part in key.split("."):
+        if not isinstance(node, dict) or part not in node:
+            return None
+        node = node[part]
+    return node
+
+
+def translate(language_code: str, key: str, **kwargs: Any) -> str:
+    language_code = str(language_code or DEFAULT_LANGUAGE).strip().lower()
+    languages = load_languages()
+    data = languages.get(language_code) or languages.get(DEFAULT_LANGUAGE, {})
+    text = _resolve_key(data, key)
+    if text is None and language_code != DEFAULT_LANGUAGE:
+        data = languages.get(DEFAULT_LANGUAGE, {})
+        text = _resolve_key(data, key)
+    if text is None:
+        return key
+    if kwargs and isinstance(text, str):
+        try:
+            return text.format(**kwargs)
+        except Exception:
+            return text
+    return str(text)
 
 
 # --- Логирование ---
@@ -95,20 +155,41 @@ def env_int_list(name: str) -> List[int]:
 
 
 class Config:
+    # --- Telegram bot ---
     BOT_TOKEN: str = os.getenv("BOT_TOKEN", "")
     ADMIN_USER_IDS: List[int] = env_int_list("ADMIN_USER_IDS")
+
+    # --- Payment / Finance ---
     PAYMENT_CARD_NUMBER: str = os.getenv("PAYMENT_CARD_NUMBER", "")
+    YOOMONEY_WALLET: str = os.getenv("YOOMONEY_WALLET", "")
+    PAYMENT_PROCESSING_TIMEOUT_SEC: int = env_int(
+        "PAYMENT_PROCESSING_TIMEOUT_SEC", 15 * 60
+    )
+
+    # --- 3X-UI panel ---
     PANEL_BASE: str = os.getenv("PANEL_BASE", "").rstrip("/")
     SUB_PANEL_BASE: str = os.getenv("SUB_PANEL_BASE", "")
     PANEL_LOGIN: str = os.getenv("PANEL_LOGIN", "")
     PANEL_PASSWORD: str = os.getenv("PANEL_PASSWORD", "")
     PANEL_TOKEN: str = os.getenv("PANEL_TOKEN", "")
     VERIFY_SSL: bool = str_to_bool(os.getenv("VERIFY_SSL", "true"))
+
+    # --- Data storage ---
     DATA_DIR: str = os.getenv("DATA_DIR", "/data")
     DATA_FILE: str = os.getenv("DATA_FILE", os.path.join(DATA_DIR, "users.db"))
     DATA_AWAIT: str = os.getenv(
         "DATA_AWAIT", os.path.join(DATA_DIR, "await_payments.json")
     )
+    TARIFFS_PATH: str = os.getenv(
+        "TARIFFS_PATH", os.path.join(BASE_DIR, "data", "tarifs.json")
+    )
+    # --- SSH ---
+    SSH_HOST: str = os.getenv("SSH_HOST", "")
+    SSH_USER: str = os.getenv("SSH_USER", "root")
+    SSH_KEY_PATH: str = os.getenv("SSH_KEY_PATH", "")
+    SSH_PASSWORD: str = os.getenv("SSH_PASSWORD", "")
+
+    # --- Public links ---
     SITE_URL: str = os.getenv("SITE_URL", "")
     SUPPORT_URL: str = os.getenv("SUPPORT_URL", "")
     QNA_URL: str = os.getenv("QNA_URL", "")
@@ -117,17 +198,11 @@ class Config:
     TIKTOK_URL: str = os.getenv("TIKTOK_URL", "")
     YOUTUBE_URL: str = os.getenv("YOUTUBE_URL", "")
     TELEGRAM_URL: str = os.getenv("TELEGRAM_URL", "")
+
+    # --- Referrals and bonuses ---
     REF_BONUS_DAYS: int = env_int("REF_BONUS_DAYS", 7)
-    SSH_HOST: str = os.getenv("SSH_HOST", "")
-    SSH_USER: str = os.getenv("SSH_USER", "")
-    SSH_KEY_PATH: str = os.getenv("SSH_KEY_PATH", "")
-    SSH_PASSWORD: str = os.getenv("SSH_PASSWORD", "")
-    TARIFFS_PATH: str = os.getenv(
-        "TARIFFS_PATH", os.path.join(BASE_DIR, "data", "tarifs.json")
-    )
-    PAYMENT_PROCESSING_TIMEOUT_SEC: int = env_int(
-        "PAYMENT_PROCESSING_TIMEOUT_SEC", 15 * 60
-    )
+
+    # --- Trust score settings ---
     TRUST_SCORE_MIN: int = env_int("TRUST_SCORE_MIN", 0)
     TRUST_SCORE_MAX: int = env_int("TRUST_SCORE_MAX", 100)
     TRUST_SCORE_EARN_PERCENT: int = env_int("TRUST_SCORE_EARN_PERCENT", 5)
@@ -140,6 +215,8 @@ class Config:
     TRUST_SCORE_PENALTY_PAYMENT_REJECTED: int = env_int(
         "TRUST_SCORE_PENALTY_PAYMENT_REJECTED", 10
     )
+
+    # --- Custom tariff settings ---
     CUSTOM_TARIFF_ENABLED: bool = str_to_bool(
         os.getenv("CUSTOM_TARIFF_ENABLED", "false")
     )
@@ -163,6 +240,7 @@ except Exception as e:
     logger.warning(f"Не удалось создать папку DATA_DIR={Config.DATA_DIR}: {e}")
 
 ADMIN_USER_ID_SET = set(Config.ADMIN_USER_IDS)
+LANGUAGES = load_languages()
 
 
 # --- Тарифы ---
@@ -236,7 +314,6 @@ def parse_float_value(value: Any, default: float = 0.0) -> float:
 
 
 class TariffCatalog:
-    """Хранит и предоставляет тарифы из JSON-файла."""
 
     def __init__(self, path: str):
         self.path = path
@@ -458,7 +535,7 @@ def format_server_label(code: Any) -> str:
 def format_servers(servers: Any) -> str:
     normalized = normalize_servers(servers)
     if not normalized:
-        return "Все доступные"
+        return translate(DEFAULT_LANGUAGE, "texts.all_available")
     labels = [format_server_label(server) for server in normalized]
     return ", ".join(label for label in labels if label)
 
@@ -494,13 +571,10 @@ def token_matches_inbound_label(label: str, token: Any) -> bool:
     if flag_to_country_code(value):
         return value in label
 
-    # Regex for alphanumeric matching, respecting word boundaries
     if value.isascii() and value.isalnum():
-        # Pattern to match the token as a whole word (case-insensitive on label)
         pattern = rf"(?<![A-Z]){re.escape(value.upper())}(?![A-Z])"
         return re.search(pattern, label.upper()) is not None
 
-    # Simple substring match for non-alphanumeric or other types
     if value.isascii():
         return value.upper() in label.upper()
 
@@ -510,9 +584,9 @@ def token_matches_inbound_label(label: str, token: Any) -> bool:
 def get_purchasable_catalog_plan(plan_id: str) -> Tuple[Optional[Dict[str, Any]], str]:
     plan = get_by_id(plan_id)
     if not plan or not plan.get("active", True):
-        return None, "❌ Тариф не найден или недоступен"
+        return None, translate(DEFAULT_LANGUAGE, "texts.plan_not_found")
     if is_trial_plan(plan):
-        return None, "⚠️ Пробный тариф оформляется отдельно."
+        return None, translate(DEFAULT_LANGUAGE, "texts.trial_note")
     return plan, ""
 
 
@@ -523,14 +597,14 @@ def format_traffic(traffic_gb: Any) -> str:
         return str(traffic_gb)
 
     if value >= 1024 and value % 1024 == 0:
-        return f"{int(value / 1024)} ТБ"
+        return translate(DEFAULT_LANGUAGE, "texts.traffic_tb", value=int(value / 1024))
     if value.is_integer():
-        return f"{int(value)} ГБ"
-    return f"{value} ГБ"
+        return translate(DEFAULT_LANGUAGE, "texts.traffic_gb", value=int(value))
+    return translate(DEFAULT_LANGUAGE, "texts.traffic_gb", value=value)
 
 
 def format_duration(days: int) -> str:
-    return f"{days} дней"
+    return translate(DEFAULT_LANGUAGE, "texts.duration_days", days=days)
 
 
 BYTES_IN_GB = 1073741824
@@ -546,8 +620,6 @@ TRUST_SCORE_PENALTY_PAYMENT_REJECTED = Config.TRUST_SCORE_PENALTY_PAYMENT_REJECT
 
 
 def calculate_discount_percent(trust_score: int) -> int:
-    """Вычислить процент скидки по количеству очков доверия.
-    Диапазон очков 0-100 → скидка 0-50%."""
     if trust_score <= 0:
         return 0
     return min(
@@ -557,12 +629,10 @@ def calculate_discount_percent(trust_score: int) -> int:
 
 
 def calculate_discount_amount(price: float, discount_percent: int) -> float:
-    """Вычислить размер скидки в рублях."""
     return (price * discount_percent) / 100.0
 
 
 def apply_trust_discount(price: float, trust_score: int) -> Tuple[float, int]:
-    """Применить скидку по очкам доверия. Возвращает (финальную цену, процент скидки)."""
     if trust_score <= 0:
         return price, 0
     discount_percent = calculate_discount_percent(trust_score)
@@ -574,8 +644,6 @@ def apply_trust_discount(price: float, trust_score: int) -> Tuple[float, int]:
 async def apply_trust_score_delta(
     user_id: int, requested_delta: int
 ) -> Tuple[bool, int, int, int]:
-    """Изменяет trust score и возвращает:
-    (успех, было, стало, фактическое_изменение)."""
     before = await db.get_trust_score(user_id)
     if requested_delta == 0:
         return True, before, before, 0
@@ -590,10 +658,22 @@ async def apply_trust_score_delta(
 
 def build_trust_change_line(actual_delta: int, before: int, after: int) -> str:
     if actual_delta > 0:
-        return f"Очки доверия: <b>+{actual_delta}</b> (было {before} → стало {after})."
+        return translate(
+            DEFAULT_LANGUAGE,
+            "texts.trust_change_positive",
+            delta=actual_delta,
+            before=before,
+            after=after,
+        )
     if actual_delta < 0:
-        return f"Очки доверия: <b>{actual_delta}</b> (было {before} → стало {after})."
-    return f"Очки доверия: <b>без изменений</b> (текущий баланс: {after})."
+        return translate(
+            DEFAULT_LANGUAGE,
+            "texts.trust_change_negative",
+            delta=actual_delta,
+            before=before,
+            after=after,
+        )
+    return translate(DEFAULT_LANGUAGE, "texts.trust_change_none", after=after)
 
 
 def to_int(value: Any, default: int = 0) -> int:
@@ -617,7 +697,9 @@ def to_float(value: Any, default: float = 0.0) -> float:
         return default
 
 
-CUSTOM_TARIFF_UNAVAILABLE_TEXT = "⛔ Данный раздел сейчас недоступен."
+CUSTOM_TARIFF_UNAVAILABLE_TEXT = translate(
+    DEFAULT_LANGUAGE, "texts.custom_tariff_unavailable"
+)
 
 
 def custom_tariff_enabled() -> bool:
@@ -692,9 +774,13 @@ def build_custom_plan_name(
     servers: Optional[List[str]] = None,
 ) -> str:
     servers_text = format_servers(servers)
-    return (
-        f"Кастомный ({traffic_gb} ГБ, {ip_limit} IP, "
-        f"{duration_days} дн., {servers_text})"
+    return translate(
+        DEFAULT_LANGUAGE,
+        "texts.custom_plan_name",
+        traffic_gb=traffic_gb,
+        ip_limit=ip_limit,
+        duration_days=duration_days,
+        servers_text=servers_text,
     )
 
 
@@ -739,19 +825,51 @@ def build_custom_tariff_info_block() -> str:
     locations = get_custom_locations()
     if locations:
         location_lines = "\n".join(
-            f"• {location.get('label')}: +{format_number(parse_float_value(location.get('price_per_day_rub'), 0.0))} ₽/день"
+            translate(
+                DEFAULT_LANGUAGE,
+                "texts.custom_tariff_location_line",
+                label=location.get("label"),
+                price=format_number(
+                    parse_float_value(location.get("price_per_day_rub"), 0.0)
+                ),
+            )
             for location in locations
         )
     else:
-        location_lines = "• Локации не настроены"
+        location_lines = translate(DEFAULT_LANGUAGE, "texts.custom_tariff_no_locations")
     return (
-        "<b>Кастомный тариф</b>\n"
-        f"Формула: <code>total = {base} + GB × {gb_coef} + IP × D × {ip_day_coef} + ΣLOC × D</code>\n"
-        "Параметры формулы:\n"
-        f"• <b>GB</b> — объём трафика ({min_gb}-{max_gb})\n"
-        f"• <b>IP</b> — лимит устройств ({min_ip}-{max_ip})\n"
-        f"• <b>D</b> — срок подписки в днях ({min_days}-{max_days})\n"
-        f"• <b>LOC</b> — выбранные локации:\n{location_lines}"
+        translate(DEFAULT_LANGUAGE, "texts.custom_tariff_info_title")
+        + translate(
+            DEFAULT_LANGUAGE,
+            "texts.custom_tariff_info_formula",
+            base=base,
+            gb_coef=gb_coef,
+            ip_day_coef=ip_day_coef,
+        )
+        + translate(DEFAULT_LANGUAGE, "texts.custom_tariff_info_params")
+        + translate(
+            DEFAULT_LANGUAGE,
+            "texts.custom_tariff_info_gb",
+            min_gb=min_gb,
+            max_gb=max_gb,
+        )
+        + translate(
+            DEFAULT_LANGUAGE,
+            "texts.custom_tariff_info_ip",
+            min_ip=min_ip,
+            max_ip=max_ip,
+        )
+        + translate(
+            DEFAULT_LANGUAGE,
+            "texts.custom_tariff_info_days",
+            min_days=min_days,
+            max_days=max_days,
+        )
+        + translate(
+            DEFAULT_LANGUAGE,
+            "texts.custom_tariff_info_locations",
+            location_lines=location_lines,
+        )
     )
 
 
@@ -853,16 +971,10 @@ class Database:
                     ip_limit INTEGER DEFAULT 0,
                     traffic_gb INTEGER DEFAULT 0,
                     vpn_url TEXT DEFAULT '',
-                    trust_score INTEGER DEFAULT 0
+                    trust_score INTEGER DEFAULT 0,
+                    language TEXT DEFAULT ''
                 )
                 """)
-            async with self.conn.execute("PRAGMA table_info(users)") as cursor:
-                rows = await cursor.fetchall()
-            columns = {row[1] for row in rows}
-            if "plan_servers" not in columns:
-                await self.conn.execute(
-                    "ALTER TABLE users ADD COLUMN plan_servers TEXT DEFAULT ''"
-                )
             await self.conn.commit()
 
     async def add_user(self, user_id: int) -> bool:
@@ -965,9 +1077,7 @@ class Database:
         return [int(row[0]) for row in rows]
 
     async def ban_user(self, user_id: int, reason: str = "") -> bool:
-        # Добавить пользователя, если его нет в БД
         await self.add_user(user_id)
-        # Обнулить очки доверия при блокировке
         await self.reset_trust_score(user_id)
         return await self.update_user(user_id, banned=True, ban_reason=reason)
 
@@ -992,6 +1102,7 @@ class Database:
             ip_limit=ip_limit,
             vpn_url=vpn_url,
             traffic_gb=traffic_gb,
+            expiry_alert_sent=0,
         )
 
     async def remove_subscription(self, user_id: int) -> bool:
@@ -1002,6 +1113,33 @@ class Database:
             ip_limit=0,
             vpn_url="",
             traffic_gb=0,
+            expiry_alert_sent=0,
+        )
+
+    async def get_user_language(self, user_id: int) -> str:
+        if not self.conn:
+            return ""
+        async with self.lock:
+            async with self.conn.execute(
+                "SELECT language FROM users WHERE user_id = ?", (user_id,)
+            ) as cursor:
+                row = await cursor.fetchone()
+        if not row:
+            return ""
+        return str(row[0] or "").strip().lower()
+
+    async def set_user_language(self, user_id: int, language: str) -> bool:
+        if not self.conn:
+            return False
+        await self.add_user(user_id)
+        return await self.update_user(user_id, language=language)
+
+    async def set_expiry_notification_sent(
+        self, user_id: int, sent: bool = True
+    ) -> bool:
+        return await self.update_user(
+            user_id=user_id,
+            expiry_alert_sent=1 if sent else 0,
         )
 
     async def set_ref_by(self, user_id: int, ref_by: int) -> bool:
@@ -1084,7 +1222,6 @@ class Database:
         return int(user.get("trust_score", 0))
 
     async def add_trust_score(self, user_id: int, points: int) -> bool:
-        """Добавить очки доверия (ограничены диапазоном 0-100)."""
         if not self.conn:
             return False
         await self.add_user(user_id)
@@ -1093,7 +1230,6 @@ class Database:
         return await self.update_user(user_id, trust_score=new_score)
 
     async def reset_trust_score(self, user_id: int) -> bool:
-        """Обнулить очки доверия (при блокировке)."""
         if not self.conn:
             return False
         await self.add_user(user_id)
@@ -1259,7 +1395,6 @@ class JSONStorage:
     async def claim_pending_payment(
         self, payment_id: str, moderator_id: int, action: str
     ) -> Optional[Dict[str, Any]]:
-        """Атомарно переводит payment из pending в processing_*."""
         await self._ensure_file()
         processing_status = f"processing_{action}"
         async with self._lock:
@@ -1293,7 +1428,6 @@ class JSONStorage:
         final_status: str,
         extra_fields: Optional[Dict[str, Any]] = None,
     ) -> bool:
-        """Завершает ранее захваченный payment, если он всё ещё захвачен этим модератором."""
         await self._ensure_file()
         processing_status = f"processing_{action}"
         async with self._lock:
@@ -1327,7 +1461,6 @@ class JSONStorage:
         *,
         error_message: str = "",
     ) -> bool:
-        """Возвращает payment в pending, если обработка не завершилась."""
         await self._ensure_file()
         processing_status = f"processing_{action}"
         async with self._lock:
@@ -1924,37 +2057,85 @@ def kb(rows: List[List[Dict[str, str]]]) -> InlineKeyboardMarkup:
 def support_keyboard(include_main: bool = True) -> InlineKeyboardMarkup:
     rows: List[List[Dict[str, str]]] = []
     if Config.SUPPORT_URL and Config.SUPPORT_URL.strip():
-        rows.append([{"text": "Поддержка", "url": Config.SUPPORT_URL}])
+        rows.append(
+            [
+                {
+                    "text": translate(DEFAULT_LANGUAGE, "buttons.support"),
+                    "url": Config.SUPPORT_URL,
+                }
+            ]
+        )
     if include_main:
-        rows.append([{"text": "Главная", "callback_data": "start"}])
+        rows.append(
+            [
+                {
+                    "text": translate(DEFAULT_LANGUAGE, "buttons.main"),
+                    "callback_data": "start",
+                }
+            ]
+        )
     if not rows:
-        rows = [[{"text": "Главная", "callback_data": "start"}]]
+        rows = [
+            [
+                {
+                    "text": translate(DEFAULT_LANGUAGE, "buttons.main"),
+                    "callback_data": "start",
+                }
+            ]
+        ]
     return kb(rows)
 
 
 def build_main_keyboard(
-    is_admin: bool, has_active_subscription: bool
+    is_admin: bool, has_active_subscription: bool, language: str = DEFAULT_LANGUAGE
 ) -> List[List[Dict[str, str]]]:
     rows: List[List[Dict[str, str]]] = [
-        [{"text": "Тарифы", "callback_data": "subs"}],
+        [{"text": translate(language, "buttons.tariffs"), "callback_data": "subs"}],
     ]
 
     if is_admin or not has_active_subscription:
-        rows.append([{"text": "Купить подписку", "callback_data": "buy"}])
+        rows.append(
+            [{"text": translate(language, "buttons.buy"), "callback_data": "buy"}]
+        )
 
     rows.extend(
         [
-            [{"text": "Моя подписка", "callback_data": "mysub"}],
-            [{"text": "Реферальная система", "callback_data": "ref"}],
+            [
+                {
+                    "text": translate(language, "buttons.my_subscription"),
+                    "callback_data": "mysub",
+                }
+            ],
+            [
+                {
+                    "text": translate(language, "buttons.referral_system"),
+                    "callback_data": "ref",
+                }
+            ],
         ]
     )
 
     if is_admin:
         rows.extend(
             [
-                [{"text": "Ожидающие платежи", "callback_data": "pay_await"}],
-                [{"text": "Отправить уведомление", "callback_data": "broadcast"}],
-                [{"text": "Инструменты отладки", "callback_data": "debug_menu"}],
+                [
+                    {
+                        "text": translate("ru", "buttons.pending_payments"),
+                        "callback_data": "pay_await",
+                    }
+                ],
+                [
+                    {
+                        "text": translate("ru", "buttons.broadcast"),
+                        "callback_data": "broadcast",
+                    }
+                ],
+                [
+                    {
+                        "text": translate("ru", "buttons.debug_tools"),
+                        "callback_data": "debug_menu",
+                    }
+                ],
             ]
         )
 
@@ -1970,19 +2151,54 @@ def build_main_keyboard(
 
     bottom_row: List[Dict[str, str]] = []
     if Config.QNA_URL:
-        bottom_row.append({"text": "Q&A", "url": Config.QNA_URL})
+        bottom_row.append(
+            {"text": translate(language, "buttons.qna"), "url": Config.QNA_URL}
+        )
     if Config.PRIVACY_POLICY_URL:
         bottom_row.append(
-            {"text": "Политика конфиденциальности", "url": Config.PRIVACY_POLICY_URL}
+            {
+                "text": translate(language, "buttons.privacy_policy"),
+                "url": Config.PRIVACY_POLICY_URL,
+            }
         )
     if bottom_row:
         rows.append(bottom_row)
 
     if Config.SITE_URL:
-        rows.append([{"text": "Наш сайт", "url": Config.SITE_URL}])
+        rows.append(
+            [{"text": translate(language, "buttons.site"), "url": Config.SITE_URL}]
+        )
 
     if Config.SUPPORT_URL:
-        rows.append([{"text": "Поддержка", "url": Config.SUPPORT_URL}])
+        rows.append(
+            [
+                {
+                    "text": translate(language, "buttons.support"),
+                    "url": Config.SUPPORT_URL,
+                }
+            ]
+        )
+
+    if not is_admin:
+        lang_name = get_language_display_name(language)
+        rows.append(
+            [
+                {
+                    "text": lang_name,
+                    "callback_data": "change_language",
+                }
+            ]
+        )
+    else:
+        lang_name = get_language_display_name("ru")
+        rows.append(
+            [
+                {
+                    "text": lang_name,
+                    "callback_data": "change_language",
+                }
+            ]
+        )
 
     return rows
 
@@ -2065,14 +2281,85 @@ def is_admin_user(user_id: int) -> bool:
     return user_id in ADMIN_USER_ID_SET
 
 
+async def get_user_language(user_id: int) -> str:
+    if is_admin_user(user_id):
+        return DEFAULT_LANGUAGE
+    if not db or not db.conn:
+        return DEFAULT_LANGUAGE
+    user = await db.get_user(user_id)
+    language = str(user.get("language", "") if user else "").strip().lower()
+    return language if language in LANGUAGES else DEFAULT_LANGUAGE
+
+
+async def prompt_language_selection(event):
+    keyboard = build_language_keyboard()
+    text = translate(DEFAULT_LANGUAGE, "texts.language_prompt")
+    await smart_answer(event, text, reply_markup=keyboard, delete_origin=True)
+
+
+def build_language_keyboard() -> InlineKeyboardMarkup:
+    rows: List[List[Dict[str, str]]] = []
+    for code in get_available_languages():
+        rows.append(
+            [
+                {
+                    "text": get_language_display_name(code),
+                    "callback_data": f"lang:{code}",
+                }
+            ]
+        )
+    rows.append(
+        [
+            {
+                "text": translate(DEFAULT_LANGUAGE, "buttons.cancel"),
+                "callback_data": "start",
+            }
+        ]
+    )
+    return kb(rows)
+
+
+async def language_middleware(handler, event, data):
+    user_id = event.from_user.id
+    if is_admin_user(user_id):
+        return await handler(event, data)
+
+    if isinstance(event, CallbackQuery):
+        if event.data and (
+            event.data.startswith("lang:")
+            or event.data == "change_language"
+            or event.data == "start"
+        ):
+            return await handler(event, data)
+    elif isinstance(event, Message):
+        if event.text and event.text.strip().lower().startswith("/start"):
+            return await handler(event, data)
+
+    language = await db.get_user_language(user_id)
+    if not language:
+        await prompt_language_selection(event)
+        return None
+
+    return await handler(event, data)
+
+
 def main_menu_keyboard() -> InlineKeyboardMarkup:
-    return kb([[{"text": "Главная", "callback_data": "start"}]])
+    return kb(
+        [
+            [
+                {
+                    "text": translate(DEFAULT_LANGUAGE, "buttons.main"),
+                    "callback_data": "start",
+                }
+            ]
+        ]
+    )
 
 
 async def deny_admin_only(event) -> None:
     await smart_answer(
         event,
-        "⛔ <b>Эта команда доступна только администраторам!</b>",
+        translate(DEFAULT_LANGUAGE, "texts.admin_only_command"),
         reply_markup=main_menu_keyboard(),
         delete_origin=True,
     )
@@ -2089,7 +2376,16 @@ async def ensure_admin_access(event, *, silent: bool = False) -> bool:
 
 
 def cancel_only_keyboard() -> InlineKeyboardMarkup:
-    return kb([[{"text": "Отмена", "callback_data": "cancel"}]])
+    return kb(
+        [
+            [
+                {
+                    "text": translate(DEFAULT_LANGUAGE, "buttons.cancel"),
+                    "callback_data": "cancel",
+                }
+            ]
+        ]
+    )
 
 
 async def ensure_custom_tariff_access(
@@ -2102,10 +2398,14 @@ async def ensure_custom_tariff_access(
         await state.clear()
 
     if isinstance(event, CallbackQuery):
-        await event.answer(CUSTOM_TARIFF_UNAVAILABLE_TEXT, show_alert=True)
+        await event.answer(
+            translate(DEFAULT_LANGUAGE, "texts.custom_tariff_unavailable"),
+            show_alert=True,
+        )
     elif isinstance(event, Message):
         await event.answer(
-            CUSTOM_TARIFF_UNAVAILABLE_TEXT, reply_markup=main_menu_keyboard()
+            translate(DEFAULT_LANGUAGE, "texts.custom_tariff_unavailable"),
+            reply_markup=main_menu_keyboard(),
         )
     return False
 
@@ -2122,24 +2422,48 @@ def custom_locations_keyboard(selected_servers: Any) -> InlineKeyboardMarkup:
         rows.append(
             [
                 {
-                    "text": f"{mark} {location.get('label', code)} +{price} ₽/день",
+                    "text": translate(
+                        DEFAULT_LANGUAGE,
+                        "buttons.custom_location_option",
+                        mark=mark,
+                        label=location.get("label", code),
+                        price=price,
+                    ),
                     "callback_data": f"custom:loc:{code}",
                 }
             ]
         )
 
-    rows.append([{"text": "Готово", "callback_data": "custom:locations_done"}])
-    rows.append([{"text": "Отмена", "callback_data": "cancel"}])
+    rows.append(
+        [
+            {
+                "text": translate(DEFAULT_LANGUAGE, "buttons.done"),
+                "callback_data": "custom:locations_done",
+            }
+        ]
+    )
+    rows.append(
+        [
+            {
+                "text": translate(DEFAULT_LANGUAGE, "buttons.cancel"),
+                "callback_data": "cancel",
+            }
+        ]
+    )
     return kb(rows)
 
 
 def build_custom_locations_text(selected_servers: Any) -> str:
     selected = normalize_servers(selected_servers)
-    selected_text = format_servers(selected) if selected else "не выбраны"
-    return (
-        "<b>Кастомный тариф</b>\n\n"
-        "Шаг 4/4: выберите одну или несколько локаций.\n\n"
-        f"Выбрано: <b>{selected_text}</b>"
+    selected_text = (
+        format_servers(selected)
+        if selected
+        else translate(DEFAULT_LANGUAGE, "texts.not_selected")
+    )
+    return translate(
+        DEFAULT_LANGUAGE,
+        "texts.custom_tariff_locations_text",
+        selected_text=selected_text,
     )
 
 
@@ -2175,7 +2499,7 @@ async def show_custom_summary(event, state: FSMContext) -> None:
         await state.clear()
         await smart_answer(
             event,
-            "❌ Не удалось сформировать кастомный тариф. Начните заново.",
+            translate(DEFAULT_LANGUAGE, "texts.custom_tariff_build_failed"),
             reply_markup=main_menu_keyboard(),
             delete_origin=True,
         )
@@ -2209,54 +2533,76 @@ async def show_custom_summary(event, state: FSMContext) -> None:
         f"GB × {format_number(Config.CUSTOM_TARIFF_GB_COEF)} + "
         f"{ip_part} + LOC × D"
     )
-    text = (
-        "<b>Кастомный тариф</b>\n\n"
-        "Параметры:\n"
-        f"• Трафик: <b>{traffic_gb} ГБ</b>\n"
-        f"• Устройства: <b>{ip_limit}</b>\n"
-        f"• Срок: <b>{duration_days} дней</b>\n"
-        f"• Локации: <b>{format_servers(servers)}</b> "
-        f"(+{format_number(location_daily_total)} ₽/день)\n\n"
-        f"Формула: <code>{formula_text}</code>\n"
-        f"Стоимость без скидки: <b>{base_total} ₽</b>\n"
-    )
     if discount_percent > 0:
-        text += (
-            f"Скидка по trust score: <b>-{discount_percent}%</b>\n"
-            f"Итоговая стоимость: <b>{final_price_int} ₽</b>\n"
+        price_line = translate(
+            DEFAULT_LANGUAGE,
+            "texts.custom_tariff_summary_discount",
+            discount_percent=discount_percent,
+            final_price=final_price_int,
         )
     else:
-        text += f"Итоговая стоимость: <b>{final_price_int} ₽</b>\n"
+        price_line = translate(
+            DEFAULT_LANGUAGE,
+            "texts.custom_tariff_summary_total",
+            final_price=final_price_int,
+        )
 
     if is_admin_user(user_id):
-        text += (
-            "\nДля администраторов кастомный тариф оформляется в тестовом режиме, "
-            "без подтверждения оплаты."
+        next_step_text = translate(
+            DEFAULT_LANGUAGE, "texts.custom_tariff_admin_test_hint"
         )
         reply_markup = kb(
             [
                 [
                     {
-                        "text": "Создать тестовую подписку",
+                        "text": translate(
+                            DEFAULT_LANGUAGE, "buttons.create_test_subscription"
+                        ),
                         "callback_data": "custom:confirm_payment",
                     }
                 ],
-                [{"text": "Отмена", "callback_data": "cancel"}],
+                [
+                    {
+                        "text": translate(DEFAULT_LANGUAGE, "buttons.cancel"),
+                        "callback_data": "cancel",
+                    }
+                ],
             ]
         )
     else:
-        text += "\n\nДалее откроется согласие с офертой, затем реквизиты оплаты."
+        next_step_text = translate(
+            DEFAULT_LANGUAGE, "texts.custom_tariff_user_payment_hint"
+        )
         reply_markup = kb(
             [
                 [
                     {
-                        "text": "Продолжить",
+                        "text": translate(DEFAULT_LANGUAGE, "buttons.continue"),
                         "callback_data": f"custom:show_offer:{user_id}",
                     }
                 ],
-                [{"text": "Отмена", "callback_data": "cancel"}],
+                [
+                    {
+                        "text": translate(DEFAULT_LANGUAGE, "buttons.cancel"),
+                        "callback_data": "cancel",
+                    }
+                ],
             ]
         )
+
+    text = translate(
+        DEFAULT_LANGUAGE,
+        "texts.custom_tariff_summary",
+        traffic_gb=traffic_gb,
+        ip_limit=ip_limit,
+        duration=format_duration(duration_days),
+        servers=format_servers(servers),
+        location_daily_total=format_number(location_daily_total),
+        formula=formula_text,
+        base_total=base_total,
+        price_line=price_line,
+        next_step_text=next_step_text,
+    )
 
     await smart_answer(event, text, reply_markup=reply_markup, delete_origin=True)
 
@@ -2276,16 +2622,18 @@ def build_custom_plan_from_payment(
 ) -> Tuple[Optional[Dict[str, Any]], str]:
     custom_plan = payment.get("custom_plan")
     if not isinstance(custom_plan, dict):
-        return None, "Некорректные параметры кастомного тарифа"
+        return None, translate(DEFAULT_LANGUAGE, "texts.custom_plan_invalid_params")
 
     traffic_gb = to_int(custom_plan.get("traffic_gb"), 0)
     ip_limit = to_int(custom_plan.get("ip_limit"), 0)
     duration_days = to_int(custom_plan.get("duration_days"), 0)
     servers = normalize_servers(custom_plan.get("servers"))
     if not is_valid_custom_limits(traffic_gb, ip_limit, duration_days):
-        return None, "Параметры кастомного тарифа вне допустимого диапазона"
+        return None, translate(
+            DEFAULT_LANGUAGE, "texts.custom_plan_limits_out_of_range"
+        )
     if not is_valid_custom_servers(servers):
-        return None, "Некорректный список локаций кастомного тарифа"
+        return None, translate(DEFAULT_LANGUAGE, "texts.custom_plan_invalid_locations")
 
     plan_name = str(custom_plan.get("plan_name") or "").strip()
     plan = build_custom_plan(
@@ -2304,39 +2652,54 @@ def build_pending_payment_text(payment: Dict[str, Any]) -> str:
     plan_id = payment.get("plan_id", "")
     amount = payment.get("amount", 0)
     plan_type = str(payment.get("plan_type", "catalog"))
-
     plan_name = str(payment.get("plan_name") or "").strip()
-    custom_details = ""
+
+    payment_method_raw = str(payment.get("payment_method", "p2p")).lower()
+    payment_method_text = (
+        "ЮMoney" if payment_method_raw == "yoomoney" else "P2P на карту"
+    )
+
+    custom_details = " "
     if plan_type == "custom":
         plan, _ = build_custom_plan_from_payment(payment)
         if plan:
-            plan_name = plan_name or plan.get("name", "Кастомный")
-            custom_details = (
-                f"\n⚙️ <b>Параметры:</b> "
-                f"{plan.get('traffic_gb', 0)} ГБ, "
-                f"{plan.get('ip_limit', 0)} IP, "
-                f"{plan.get('duration_days', 0)} дн., "
-                f"{format_servers(plan.get('servers'))}"
+            plan_name = plan_name or plan.get(
+                "name", translate(DEFAULT_LANGUAGE, "texts.custom_plan_short_name")
+            )
+            custom_details = translate(
+                DEFAULT_LANGUAGE,
+                "texts.pending_payment_custom_details",
+                traffic=format_traffic(plan.get("traffic_gb", 0)),
+                ip_limit=plan.get("ip_limit", 0),
+                duration=format_duration(int(plan.get("duration_days", 0))),
+                servers=format_servers(plan.get("servers")),
             )
         else:
-            plan_name = plan_name or "Кастомный"
+            plan_name = plan_name or translate(
+                DEFAULT_LANGUAGE, "texts.custom_plan_short_name"
+            )
     else:
         plan, _ = get_purchasable_catalog_plan(str(plan_id))
         if plan:
             plan_name = plan_name or plan.get("name", plan_id)
-            custom_details = (
-                f"\n🌍 <b>Локации:</b> {format_servers(plan.get('servers'))}"
+            custom_details = translate(
+                DEFAULT_LANGUAGE,
+                "texts.pending_payment_catalog_locations",
+                servers=format_servers(plan.get("servers")),
             )
         elif not plan_name:
             plan_name = str(plan_id)
 
-    return (
-        f"📋 <b>Платеж ID:</b> <code>{payment_id}</code>\n"
-        f"👤 <b>Пользователь:</b> <code>{user_id}</code>\n"
-        f"📦 <b>Тариф:</b> {plan_name}\n"
-        f"{custom_details}\n"
-        f"💰 <b>Сумма:</b> {amount} ₽\n"
-        f"🕐 <b>Время:</b> {format_payment_time(payment.get('timestamp'))}"
+    return translate(
+        DEFAULT_LANGUAGE,
+        "texts.pending_payment_text",
+        payment_id=payment_id,
+        user_id=user_id,
+        plan_name=plan_name,
+        details=custom_details,
+        payment_method=payment_method_text,
+        amount=amount,
+        timestamp=format_payment_time(payment.get("timestamp")),
     )
 
 
@@ -2345,15 +2708,20 @@ def build_pending_payment_keyboard(payment_id: str) -> InlineKeyboardMarkup:
         [
             [
                 {
-                    "text": "✅ Подтвердить",
+                    "text": translate(DEFAULT_LANGUAGE, "buttons.confirm_payment"),
                     "callback_data": f"pay_await_accept:{payment_id}",
                 },
                 {
-                    "text": "❌ Отклонить",
+                    "text": translate(DEFAULT_LANGUAGE, "buttons.reject_payment"),
                     "callback_data": f"pay_await_reject:{payment_id}",
                 },
             ],
-            [{"text": "Главная", "callback_data": "start"}],
+            [
+                {
+                    "text": translate(DEFAULT_LANGUAGE, "buttons.main"),
+                    "callback_data": "start",
+                }
+            ],
         ]
     )
 
@@ -2365,7 +2733,7 @@ async def claim_pending_payment_or_alert(
     payment = await json_db.claim_pending_payment(payment_id, moderator_id, action)
     if not payment:
         await event.answer(
-            "❌ Платеж не найден, уже обработан или сейчас обрабатывается другим администратором.",
+            translate(DEFAULT_LANGUAGE, "texts.payment_claim_unavailable"),
             show_alert=True,
         )
         return None
@@ -2381,7 +2749,7 @@ async def finalize_claimed_payment_or_alert(
     )
     if not success:
         await event.answer(
-            "❌ Не удалось завершить обработку платежа: его состояние уже изменилось.",
+            translate(DEFAULT_LANGUAGE, "texts.payment_finalize_changed"),
             show_alert=True,
         )
         return False
@@ -2405,8 +2773,6 @@ async def rollback_claimed_payment(
 
 
 async def verify_payment_final_status(payment_id: str, expected_status: str) -> bool:
-    """Проверяет что платеж находится в ожидаемом финальном статусе.
-    Используется для защиты от race condition при модерации платежей."""
     payment = await json_db.find_by_id(payment_id)
     if not payment:
         logger.warning(f"Платеж {payment_id} не найден при проверке финального статуса")
@@ -2433,36 +2799,56 @@ async def append_payment_decision_label(
 def build_tariffs_text(plans: Optional[List[Dict[str, Any]]] = None) -> str:
     plans = plans if plans is not None else get_all_active()
     if not plans:
-        text = "<b>Тарифы VPN</b>\n\nФиксированные тарифы временно недоступны."
+        text = translate(DEFAULT_LANGUAGE, "texts.tariffs_unavailable")
         if custom_tariff_enabled():
             text += "\n\n" + build_custom_tariff_info_block()
         return text
 
-    text = "<b>Тарифы VPN</b>\n\n"
+    text = translate(DEFAULT_LANGUAGE, "texts.tariffs_title")
     for idx, plan in enumerate(plans, 1):
         price = plan.get("price_rub", 0)
         duration = int(plan.get("duration_days", 30))
         if price == 0:
-            price_line = f"Бесплатно на {duration} дня"
+            price_line = translate(
+                DEFAULT_LANGUAGE,
+                "texts.price_free_for_days",
+                days=duration,
+            )
         elif duration == 30:
-            price_line = f"{price} ₽/мес"
+            price_line = translate(
+                DEFAULT_LANGUAGE,
+                "texts.price_monthly",
+                price=price,
+            )
         else:
-            price_line = f"{price} ₽ / {duration} дней"
-        text += (
-            f"{idx}. <b>{plan.get('name', plan.get('id'))}</b>\n"
-            f"   Стоимость: {price_line}\n"
-            f"   Устройства: до {plan.get('ip_limit', 0)}\n"
-            f"   Трафик: до {format_traffic(plan.get('traffic_gb', 0))}\n"
+            price_line = translate(
+                DEFAULT_LANGUAGE,
+                "texts.price_fixed_days",
+                price=price,
+                duration=duration,
+            )
+        text += translate(
+            DEFAULT_LANGUAGE,
+            "texts.plan_block",
+            idx=idx,
+            name=plan.get("name", plan.get("id")),
+            price_line=price_line,
+            ip_limit=plan.get("ip_limit", 0),
+            traffic=format_traffic(plan.get("traffic_gb", 0)),
         )
         servers = get_plan_servers(plan)
         if servers:
-            text += f"   Локации: {format_servers(servers)}\n"
+            text += translate(
+                DEFAULT_LANGUAGE,
+                "texts.plan_block_servers",
+                servers=format_servers(servers),
+            )
         text += "\n"
 
     if custom_tariff_enabled():
         text += build_custom_tariff_info_block() + "\n\n"
 
-    text += "Список стран и серверов будет расширяться."
+    text += translate(DEFAULT_LANGUAGE, "texts.tariffs_footer")
     return text
 
 
@@ -2471,38 +2857,52 @@ def build_buy_text(
 ) -> str:
     plans = plans if plans is not None else get_all_active()
     if not plans:
-        text = (
-            "<b>Покупка подписки VPN</b>\n\n"
-            "Фиксированные тарифы временно недоступны."
-        )
+        text = translate(DEFAULT_LANGUAGE, "texts.buy_unavailable")
         if custom_tariff_enabled():
-            text += "\n\nДоступен кастомный тариф по кнопке ниже."
+            text += translate(DEFAULT_LANGUAGE, "texts.buy_custom_button_hint")
         return text
 
-    text = "<b>Покупка подписки VPN</b>\n\nВыберите тариф:\n\n"
+    text = translate(DEFAULT_LANGUAGE, "texts.buy_title")
     for idx, plan in enumerate(plans, 1):
         price = plan.get("price_rub", 0)
         duration = int(plan.get("duration_days", 30))
         if price == 0:
-            price_line = f"Бесплатно на {duration} дня"
+            price_line = translate(
+                DEFAULT_LANGUAGE,
+                "texts.price_free_for_days",
+                days=duration,
+            )
         elif duration == 30:
-            price_line = f"{price} ₽/мес"
+            price_line = translate(
+                DEFAULT_LANGUAGE,
+                "texts.price_monthly",
+                price=price,
+            )
         else:
-            price_line = f"{price} ₽ / {duration} дней"
+            price_line = translate(
+                DEFAULT_LANGUAGE,
+                "texts.price_fixed_days",
+                price=price,
+                duration=duration,
+            )
         servers = get_plan_servers(plan)
         servers_text = f" — {format_servers(servers)}" if servers else ""
-        text += (
-            f"{idx}. <b>{plan.get('name', plan.get('id'))}</b> — "
-            f"{price_line}{servers_text}\n"
+        text += translate(
+            DEFAULT_LANGUAGE,
+            "texts.buy_plan_option",
+            idx=idx,
+            name=plan.get("name", plan.get("id")),
+            price_line=price_line,
+            servers_text=servers_text,
         )
 
     if custom_tariff_enabled():
-        text += "\n\nКастомный тариф доступен отдельной кнопкой ниже списка."
+        text += translate(DEFAULT_LANGUAGE, "texts.buy_custom_button_hint")
 
     if for_admin:
-        text += "\nДля администраторов доступны тестовые подключения без оплаты."
+        text += translate(DEFAULT_LANGUAGE, "texts.buy_admin_custom_hint")
     else:
-        text += "\nПосле выбора тарифа откроются согласие с офертой и шаг оплаты."
+        text += translate(DEFAULT_LANGUAGE, "texts.buy_user_payment_hint")
     return text
 
 
@@ -2526,24 +2926,48 @@ async def get_visible_plans(user_id: int, *, for_admin: bool) -> List[Dict[str, 
 def active_subscription_keyboard() -> InlineKeyboardMarkup:
     return kb(
         [
-            [{"text": "Моя подписка", "callback_data": "mysub"}],
-            [{"text": "Главная", "callback_data": "start"}],
+            [
+                {
+                    "text": translate(DEFAULT_LANGUAGE, "buttons.my_subscription"),
+                    "callback_data": "mysub",
+                }
+            ],
+            [
+                {
+                    "text": translate(DEFAULT_LANGUAGE, "buttons.main"),
+                    "callback_data": "start",
+                }
+            ],
         ]
     )
 
 
 def inactive_subscription_actions_keyboard() -> InlineKeyboardMarkup:
     rows: List[List[Dict[str, str]]] = [
-        [{"text": "Купить подписку", "callback_data": "buy"}]
+        [{"text": translate(DEFAULT_LANGUAGE, "buttons.buy"), "callback_data": "buy"}]
     ]
     if Config.SUPPORT_URL:
-        rows.append([{"text": "Поддержка", "url": f"{Config.SUPPORT_URL}"}])
-    rows.append([{"text": "Главная", "callback_data": "start"}])
+        rows.append(
+            [
+                {
+                    "text": translate(DEFAULT_LANGUAGE, "buttons.support"),
+                    "url": f"{Config.SUPPORT_URL}",
+                }
+            ]
+        )
+    rows.append(
+        [
+            {
+                "text": translate(DEFAULT_LANGUAGE, "buttons.main"),
+                "callback_data": "start",
+            }
+        ]
+    )
     return kb(rows)
 
 
 async def show_active_subscription_guard(event) -> None:
-    text = "⚠️ У вас уже есть активная подписка.\n\n" "Новый заказ сейчас недоступен."
+    text = translate(DEFAULT_LANGUAGE, "texts.active_subscription_guard")
     await smart_answer(
         event,
         text,
@@ -2562,32 +2986,30 @@ def build_subscription_cleanup_message(
     if trust_before is not None and trust_after is not None:
         trust_line = build_trust_change_line(trust_delta, trust_before, trust_after)
     elif reason == "traffic_exhausted":
-        trust_line = (
-            "Очки доверия: <b>штраф применён</b> "
-            f"(до {TRUST_SCORE_PENALTY_TRAFFIC_EXHAUSTED} очков)."
+        trust_line = translate(
+            DEFAULT_LANGUAGE,
+            "texts.trust_penalty_applied",
+            penalty=TRUST_SCORE_PENALTY_TRAFFIC_EXHAUSTED,
         )
     else:
-        trust_line = "Очки доверия: <b>без изменений</b>."
+        trust_line = translate(DEFAULT_LANGUAGE, "texts.trust_change_short_none")
 
     if reason == "traffic_exhausted":
-        return (
-            "⚠️ <b>Пакет трафика исчерпан.</b>\n\n"
-            "Ваша подписка была удалена. "
-            "Купите новую подписку или обратитесь в поддержку.\n\n"
-            f"{trust_line}"
+        return translate(
+            DEFAULT_LANGUAGE,
+            "texts.subscription_cleanup_traffic_exhausted",
+            trust_line=trust_line,
         )
     if reason == "expired":
-        return (
-            "⏰ <b>Срок подписки истёк.</b>\n\n"
-            "Ваша подписка была удалена. "
-            "Купите новую подписку или обратитесь в поддержку.\n\n"
-            f"{trust_line}"
+        return translate(
+            DEFAULT_LANGUAGE,
+            "texts.subscription_cleanup_expired",
+            trust_line=trust_line,
         )
-    return (
-        "⚠️ <b>Подписка больше неактивна.</b>\n\n"
-        "Ваша подписка была удалена. "
-        "Купите новую подписку или обратитесь в поддержку.\n\n"
-        f"{trust_line}"
+    return translate(
+        DEFAULT_LANGUAGE,
+        "texts.subscription_cleanup_inactive",
+        trust_line=trust_line,
     )
 
 
@@ -2667,7 +3089,6 @@ async def cleanup_subscription(
         )
         return result
 
-    # Применить штраф за очки доверия при истощении трафика
     if reason == "traffic_exhausted":
         changed, trust_before, trust_after, trust_delta = await apply_trust_score_delta(
             user_id, -TRUST_SCORE_PENALTY_TRAFFIC_EXHAUSTED
@@ -2800,7 +3221,6 @@ async def create_subscription(
         await db.clear_bonus_days_pending(user_id)
 
     if earn_trust:
-        # Начислить очки доверия: 5% от стоимости подписки
         price = to_float(plan.get("price_rub", 0), 0.0)
         earned_points = int((price * TRUST_SCORE_EARN_PERCENT) / 100)
         if earned_points > 0:
@@ -2810,6 +3230,152 @@ async def create_subscription(
             )
 
     return build_subscription_url(sub_id)
+
+
+def is_expiring_soon(state: Dict[str, Any], days: int = 3) -> bool:
+    max_expiry = to_int(state.get("max_expiry"), 0)
+    if max_expiry <= 0:
+        return False
+    remaining_ms = max_expiry - int(time.time() * 1000)
+    return 0 < remaining_ms <= days * 86400 * 1000
+
+
+async def renew_subscription(
+    user_id: int,
+    plan: Dict[str, Any],
+    *,
+    extra_days: int = 0,
+    earn_trust: bool = True,
+) -> Optional[str]:
+    if not plan:
+        return None
+
+    state = await get_subscription_state(user_id)
+    if state.get("status") != "active":
+        return await create_subscription(user_id, plan, extra_days=extra_days)
+
+    max_expiry = to_int(state.get("max_expiry"), 0)
+    now_ms = int(time.time() * 1000)
+    if max_expiry <= now_ms:
+        return await create_subscription(user_id, plan, extra_days=extra_days)
+
+    pending_days = await db.get_bonus_days_pending(user_id)
+    days = int(plan.get("duration_days", 30)) + extra_days + pending_days
+    if days <= 0:
+        days = 1
+
+    plan_servers = get_plan_servers(plan)
+    inbound_ids = await panel.get_matching_inbound_ids(plan_servers)
+    if inbound_ids is None:
+        return None
+    if not inbound_ids:
+        logger.error(
+            f"Нельзя продлить подписку user_id={user_id}: нет inbound для локаций {format_servers(plan_servers)}"
+        )
+        return None
+
+    user_data = await db.get_user(user_id)
+    if not user_data:
+        return None
+
+    base_email = build_base_email(user_id)
+    clients = await panel.find_clients_full_by_email(base_email)
+    if not clients:
+        return None
+
+    success = False
+    for client in clients:
+        email = str(client.get("email") or "")
+        if not email:
+            continue
+
+        client_obj = (
+            await panel.get_client_by_email(email) or client.get("clientObj") or client
+        )
+        if not isinstance(client_obj, dict):
+            continue
+
+        current_expiry = to_int(
+            client_obj.get("expiryTime", client.get("expiryTime")), 0
+        )
+        if current_expiry and current_expiry > now_ms:
+            new_expiry = int(current_expiry + days * 86400 * 1000)
+        else:
+            new_expiry = int((time.time() + days * 86400) * 1000)
+
+        client_obj["expiryTime"] = new_expiry
+        client_obj["limitIp"] = int(plan.get("ip_limit", 0))
+        client_obj["totalGB"] = int(plan.get("traffic_gb", 0) * BYTES_IN_GB)
+        client_obj["enable"] = True
+
+        payload = panel._client_payload_for_update(client_obj)
+        update_url = (
+            f"{panel.apibase}/panel/api/clients/update/{panel._quote_path(email)}"
+        )
+        status, data, text = await panel._request_json_with_reauth(
+            "POST",
+            update_url,
+            headers=panel._headers(),
+            json=payload,
+        )
+
+        if status in (200, 201) and data.get("success"):
+            success = True
+        else:
+            logger.error(
+                f"Ошибка clients/update email={email}: status={status} msg={data.get('msg')}"
+            )
+            if text:
+                logger.error(text)
+
+        existing_inbound_ids = [
+            to_int(i, 0)
+            for i in (client_obj.get("inboundIds") or [])
+            if to_int(i, 0) > 0
+        ]
+        for inbound_id in inbound_ids:
+            if inbound_id not in existing_inbound_ids:
+                attached = await panel.create_client_in_inbound(
+                    inbound_id=inbound_id,
+                    email=email,
+                    limit_ip=int(plan.get("ip_limit", 0)),
+                    total_gb=int(plan.get("traffic_gb", 0)),
+                    expiry_ms=new_expiry,
+                    sub_id=str(user_data.get("vpn_url") or build_base_email(user_id)),
+                )
+                if attached:
+                    success = True
+
+    if not success:
+        return None
+
+    plan_name = plan.get("name", plan.get("id", ""))
+    vpn_url = str(user_data.get("vpn_url") or "")
+    if not vpn_url:
+        return await create_subscription(user_id, plan, extra_days=extra_days)
+
+    await db.set_subscription(
+        user_id=user_id,
+        plan_text=plan_name,
+        ip_limit=int(plan.get("ip_limit", 0)),
+        traffic_gb=int(plan.get("traffic_gb", 0)),
+        vpn_url=vpn_url,
+        plan_servers=plan_servers,
+    )
+
+    if pending_days > 0:
+        await db.clear_bonus_days_pending(user_id)
+
+    if earn_trust:
+        price = to_float(plan.get("price_rub", 0), 0.0)
+        earned_points = int((price * TRUST_SCORE_EARN_PERCENT) / 100)
+        if earned_points > 0:
+            await db.add_trust_score(user_id, earned_points)
+            logger.info(
+                f"Начислено {earned_points} очков доверия для user_id={user_id} (продление {plan.get('name', plan.get('id'))})"
+            )
+
+    return build_subscription_url(vpn_url)
 
 
 async def is_active_subscription(
@@ -2822,9 +3388,64 @@ async def is_active_subscription(
     if status == "active":
         return True
     if status == "panel_unavailable" and state.get("sub_id"):
-        # Не создаем второй заказ, пока панель недоступна и в БД есть активный sub_id.
         return True
     return False
+
+
+async def notify_expiring_subscription(
+    user_id: int, state: Dict[str, Any], days: int = 3
+) -> bool:
+    if state.get("status") != "active":
+        return False
+
+    if not is_expiring_soon(state, days=days):
+        return False
+
+    user_data = await db.get_user(user_id)
+    if not user_data:
+        return False
+
+    if to_int(user_data.get("expiry_alert_sent"), 0):
+        return False
+
+    max_expiry = to_int(state.get("max_expiry"), 0)
+    remaining_ms = max_expiry - int(time.time() * 1000)
+    days_left = max(1, math.ceil(remaining_ms / (86400 * 1000)))
+
+    text = translate(
+        DEFAULT_LANGUAGE,
+        "texts.subscription_expiring_soon",
+        plan_text=user_data.get(
+            "plan_text", translate(DEFAULT_LANGUAGE, "texts.current_plan_fallback")
+        ),
+        days_left=format_duration(days_left),
+    )
+    keyboard = kb(
+        [
+            [
+                {
+                    "text": translate(DEFAULT_LANGUAGE, "buttons.renew_subscription"),
+                    "callback_data": "buy",
+                },
+            ],
+            [
+                {
+                    "text": translate(DEFAULT_LANGUAGE, "buttons.my_subscription"),
+                    "callback_data": "mysub",
+                }
+            ],
+        ]
+    )
+
+    try:
+        await notify_user(user_id, text, reply_markup=keyboard)
+        await db.set_expiry_notification_sent(user_id, True)
+        return True
+    except Exception as e:
+        logger.error(
+            f"Не удалось отправить уведомление об окончании подписки user_id={user_id}: {e}"
+        )
+        return False
 
 
 async def reward_referrer(referrer_id: int, bonus_days: int) -> None:
@@ -2845,13 +3466,22 @@ async def reward_referrer(referrer_id: int, bonus_days: int) -> None:
                 await db.clear_bonus_days_pending(referrer_id)
             await notify_user(
                 referrer_id,
-                f"🎉 Вам начислено {total_bonus} дней по реферальной программе!",
+                translate(
+                    DEFAULT_LANGUAGE,
+                    "texts.referral_bonus_days_added",
+                    bonus_days=format_duration(total_bonus),
+                ),
             )
             return
 
         await db.add_bonus_days_pending(referrer_id, bonus_days)
         await notify_admins(
-            f"⚠️ Не удалось продлить подписку реферера {referrer_id}. Бонус {bonus_days} дней сохранен в ожидании."
+            translate(
+                DEFAULT_LANGUAGE,
+                "texts.referral_bonus_extend_failed_admin",
+                referrer_id=referrer_id,
+                bonus_days=format_duration(bonus_days),
+            )
         )
         return
 
@@ -2859,7 +3489,11 @@ async def reward_referrer(referrer_id: int, bonus_days: int) -> None:
     if not min_plan:
         await db.add_bonus_days_pending(referrer_id, bonus_days)
         await notify_admins(
-            f"⚠️ Нет доступных тарифов для выдачи бонуса рефереру {referrer_id}. Бонус сохранен."
+            translate(
+                DEFAULT_LANGUAGE,
+                "texts.referral_bonus_no_plan_admin",
+                referrer_id=referrer_id,
+            )
         )
         return
 
@@ -2867,26 +3501,33 @@ async def reward_referrer(referrer_id: int, bonus_days: int) -> None:
         referrer_id,
         min_plan,
         days_override=bonus_days,
-        plan_suffix=" (реферальный бонус)",
+        plan_suffix=translate(DEFAULT_LANGUAGE, "texts.referral_bonus_plan_suffix"),
         earn_trust=False,
     )
 
     if vpn_url:
         await notify_user(
             referrer_id,
-            f"🎉 Вам выдана бесплатная подписка на {total_bonus} дней по реферальной программе!\n\nURL:\n<code>{vpn_url}</code>",
+            translate(
+                DEFAULT_LANGUAGE,
+                "texts.referral_bonus_subscription_created",
+                bonus_days=format_duration(total_bonus),
+                vpn_url=vpn_url,
+            ),
         )
     else:
         await db.add_bonus_days_pending(referrer_id, bonus_days)
         await notify_admins(
-            f"⚠️ Не удалось выдать бесплатную подписку рефереру {referrer_id}. Бонус сохранен."
+            translate(
+                DEFAULT_LANGUAGE,
+                "texts.referral_bonus_create_failed_admin",
+                referrer_id=referrer_id,
+            )
         )
 
 
 # --- Фоновые задачи ---
 async def cleanup_stale_payments() -> int:
-    """Освобождает платежи которые зависли в processing более чем на PAYMENT_PROCESSING_TIMEOUT_SEC.
-    Используется при завершении бота для предотвращения deadlock зависших платежей."""
     try:
         released = await json_db.release_stale_processing_payments()
         if released > 0:
@@ -2907,6 +3548,8 @@ async def check_expired_subscriptions():
                     user_id, notify_user_about_cleanup=True
                 )
                 status = state.get("status")
+                if status == "active":
+                    await notify_expiring_subscription(user_id, state, days=3)
                 if status == "panel_unavailable":
                     logger.warning(
                         f"Проверка подписки user_id={user_id} отложена: панель недоступна"
@@ -2958,7 +3601,7 @@ class SSLUpdateTask:
     async def run():
         while True:
             try:
-                await asyncio.sleep(432000)  # 5 days = 432000 seconds
+                await asyncio.sleep(432000)
 
                 if not Config.SSH_HOST or not Config.SSH_USER:
                     logger.warning("SSH настройки не заданы, пропуск обновления SSL")
@@ -2985,11 +3628,9 @@ class SSLUpdateTask:
                     else:
                         raise ValueError("Не заданы SSH пароль или ключ")
 
-                    # Получить интерактивную оболочку
                     shell = ssh.invoke_shell()
-                    await asyncio.sleep(1)  # Подождать инициализации
+                    await asyncio.sleep(5)
 
-                    # Команды для обновления SSL
                     commands = [
                         "service nginx stop",
                         "x-ui",
@@ -3000,25 +3641,20 @@ class SSLUpdateTask:
                         "80",  # Порт 80
                     ]
 
-                    # Отправить команды
                     for cmd in commands:
                         shell.send(cmd + "\n")
-                        await asyncio.sleep(5)  # Пауза между командами
+                        await asyncio.sleep(5)
 
-                    # Дополнительное ожидание для получения SSL (дольше)
-                    await asyncio.sleep(60)  # 1 минута на получение сертификата
+                    await asyncio.sleep(60)
 
-                    # Включить nginx обратно
                     shell.send("service nginx start\n")
                     await asyncio.sleep(5)
 
-                    # Закрыть соединение
                     shell.close()
                     ssh.close()
 
                     logger.info("SSL обновление выполнено успешно")
 
-                    # Notify admins
                     for admin_id in Config.ADMIN_USER_IDS:
                         try:
                             await notify_user(
@@ -3035,7 +3671,6 @@ class SSLUpdateTask:
 
             except Exception as e:
                 logger.error(f"Ошибка обновления SSL: {e}")
-                # Notify admins about failure
                 for admin_id in Config.ADMIN_USER_IDS:
                     try:
                         await notify_user(
@@ -3043,7 +3678,7 @@ class SSLUpdateTask:
                         )
                     except Exception:
                         pass
-                await asyncio.sleep(3600)  # Wait 1 hour before retry
+                await asyncio.sleep(3600)
 
 
 # --- Инициализация ---
@@ -3075,26 +3710,30 @@ async def ban_middleware(handler, event, data):
 
     user_data = await db.get_user(user_id)
     if user_data and user_data.get("banned"):
-        ban_reason = user_data.get("ban_reason", "Не указана")
+        ban_reason = user_data.get(
+            "ban_reason", translate(DEFAULT_LANGUAGE, "texts.not_specified")
+        )
         support_kb = support_keyboard(include_main=True)
+        ban_text = translate(
+            DEFAULT_LANGUAGE,
+            "texts.account_banned_message",
+            reason=ban_reason,
+        )
         if isinstance(event, Message):
             await event.answer(
-                "⛔ <b>Ваш аккаунт заблокирован!</b>\n\n"
-                f"Причина: {ban_reason}\n\n"
-                "Ваши очки доверия были обнулены.\n\n"
-                "Если вы считаете, что это ошибка, пожалуйста, свяжитесь с поддержкой.",
+                ban_text,
                 reply_markup=support_kb,
             )
         elif isinstance(event, CallbackQuery):
             if event.message:
                 await event.message.answer(
-                    "⛔ <b>Ваш аккаунт заблокирован!</b>\n\n"
-                    f"Причина: {ban_reason}\n\n"
-                    "Ваши очки доверия были обнулены.\n\n"
-                    "Если вы считаете, что это ошибка, пожалуйста, свяжитесь с поддержкой.",
+                    ban_text,
                     reply_markup=support_kb,
                 )
-            await event.answer("⛔ Ваш аккаунт заблокирован.", show_alert=True)
+            await event.answer(
+                translate(DEFAULT_LANGUAGE, "texts.account_banned_alert"),
+                show_alert=True,
+            )
         return None
 
     return await handler(event, data)
@@ -3102,6 +3741,8 @@ async def ban_middleware(handler, event, data):
 
 router.message.middleware(ban_middleware)
 router.callback_query.middleware(ban_middleware)
+router.message.middleware(language_middleware)
+router.callback_query.middleware(language_middleware)
 
 
 # --- Обработчики команд ---
@@ -3119,13 +3760,22 @@ async def cmd_start(event, state: FSMContext):
         user_id = event.from_user.id
         ref_code = ""
 
-    await db.add_user(user_id)
-    await db.ensure_ref_code(user_id)
+    user_language = DEFAULT_LANGUAGE
+    if is_admin_user(user_id):
+        user_language = DEFAULT_LANGUAGE
+    else:
+        await db.add_user(user_id)
+        await db.ensure_ref_code(user_id)
 
-    if ref_code:
-        ref_user = await db.get_user_by_ref_code(ref_code)
-        if ref_user and ref_user.get("user_id") != user_id:
-            await db.set_ref_by(user_id, int(ref_user.get("user_id")))
+        if ref_code:
+            ref_user = await db.get_user_by_ref_code(ref_code)
+            if ref_user and ref_user.get("user_id") != user_id:
+                await db.set_ref_by(user_id, int(ref_user.get("user_id")))
+
+        user_language = await db.get_user_language(user_id)
+        if not user_language:
+            await prompt_language_selection(event)
+            return
 
     total_users = await db.get_total_users()
     banned_users = await db.get_banned_users_count()
@@ -3138,21 +3788,29 @@ async def cmd_start(event, state: FSMContext):
         )
 
     if is_admin_user(user_id):
-        text = (
-            "👑 <b>Добро пожаловать, администратор!</b>\n\n"
-            f"Всего пользователей: <b>{total_users}</b>\n"
-            f"Активных VPN: <b>{active_vpns}</b>\n"
-            f"Заблокированных пользователей: <b>{banned_users}</b>"
-        )
-        keyboard = build_main_keyboard(is_admin=True, has_active_subscription=False)
-    else:
-        text = (
-            "👋 <b>Добро пожаловать в VPN бот!</b>\n\n"
-            f"Всего пользователей: <b>{total_users}</b>\n"
-            f"Активных VPN: <b>{active_vpns}</b>"
+        text = translate(
+            "ru",
+            "texts.admin_welcome",
+            total_users=total_users,
+            active_vpns=active_vpns,
+            banned_users=banned_users,
         )
         keyboard = build_main_keyboard(
-            is_admin=False, has_active_subscription=has_active_subscription
+            is_admin=True,
+            has_active_subscription=False,
+            language="ru",
+        )
+    else:
+        text = translate(
+            user_language,
+            "texts.welcome",
+            total_users=total_users,
+            active_vpns=active_vpns,
+        )
+        keyboard = build_main_keyboard(
+            is_admin=False,
+            has_active_subscription=has_active_subscription,
+            language=user_language,
         )
 
     await smart_answer(event, text, reply_markup=kb(keyboard), delete_origin=True)
@@ -3165,21 +3823,85 @@ async def cmd_cancel(event, state: FSMContext):
     await cmd_start(event, state)
 
 
+@router.callback_query(F.data == "change_language")
+async def cmd_change_language(event: CallbackQuery, state: FSMContext):
+    user_id = event.from_user.id
+    if is_admin_user(user_id):
+        keyboard = build_language_keyboard()
+        await smart_answer(
+            event,
+            translate("ru", "texts.language_decorative_notice"),
+            reply_markup=keyboard,
+            delete_origin=True,
+        )
+        return
+    await prompt_language_selection(event)
+
+
+@router.callback_query(F.data.startswith("lang:"))
+async def cmd_set_language(event: CallbackQuery, state: FSMContext):
+    user_id = event.from_user.id
+    selected_language = event.data.split(":", 1)[1] if ":" in event.data else ""
+    if is_admin_user(user_id):
+        await event.answer(
+            translate("ru", "texts.admin_language_notice"), show_alert=True
+        )
+        await cmd_start(event, state)
+        return
+    if selected_language not in LANGUAGES:
+        await event.answer(
+            translate(DEFAULT_LANGUAGE, "texts.language_not_supported"), show_alert=True
+        )
+        return
+    await db.add_user(user_id)
+    await db.set_user_language(user_id, selected_language)
+    await event.answer(
+        translate(
+            selected_language,
+            "texts.language_selected",
+            language=get_language_display_name(selected_language),
+        ),
+        show_alert=True,
+    )
+    await cmd_start(event, state)
+
+
 # --- subs ---
 @router.callback_query(F.data == "subs")
 async def cmd_subs(event):
     user_id = event.from_user.id
-    await db.add_user(user_id)
     is_admin = is_admin_user(user_id)
+    if not is_admin:
+        await db.add_user(user_id)
     plans = await get_visible_plans(user_id, for_admin=is_admin)
     text = build_tariffs_text(plans)
 
     if is_admin:
         keyboard = [
-            [{"text": "Подтверждение платежей", "callback_data": "pay_await"}],
-            [{"text": "Купить подписку", "callback_data": "buy"}],
-            [{"text": "Моя подписка", "callback_data": "mysub"}],
-            [{"text": "Главная", "callback_data": "start"}],
+            [
+                {
+                    "text": translate(DEFAULT_LANGUAGE, "buttons.pay_await"),
+                    "callback_data": "pay_await",
+                }
+            ],
+            [
+                {
+                    "text": translate(DEFAULT_LANGUAGE, "buttons.buy"),
+                    "callback_data": "buy",
+                }
+            ],
+            [
+                {
+                    "text": translate(DEFAULT_LANGUAGE, "buttons.my_subscription"),
+                    "callback_data": "mysub",
+                }
+            ],
+            [
+                {
+                    "text": translate(DEFAULT_LANGUAGE, "buttons.main"),
+                    "callback_data": "start",
+                }
+            ],
         ]
     else:
         has_active_subscription = await is_active_subscription(
@@ -3187,11 +3909,28 @@ async def cmd_subs(event):
         )
         keyboard: List[List[Dict[str, str]]] = []
         if not has_active_subscription:
-            keyboard.append([{"text": "Купить подписку", "callback_data": "buy"}])
+            keyboard.append(
+                [
+                    {
+                        "text": translate(DEFAULT_LANGUAGE, "buttons.buy"),
+                        "callback_data": "buy",
+                    }
+                ]
+            )
         keyboard.extend(
             [
-                [{"text": "Моя подписка", "callback_data": "mysub"}],
-                [{"text": "Главная", "callback_data": "start"}],
+                [
+                    {
+                        "text": translate(DEFAULT_LANGUAGE, "buttons.my_subscription"),
+                        "callback_data": "mysub",
+                    }
+                ],
+                [
+                    {
+                        "text": translate(DEFAULT_LANGUAGE, "buttons.main"),
+                        "callback_data": "start",
+                    }
+                ],
             ]
         )
 
@@ -3202,24 +3941,35 @@ async def cmd_subs(event):
 @router.callback_query(F.data == "buy")
 async def cmd_buy(event):
     user_id = event.from_user.id
-    await db.add_user(user_id)
     is_admin = is_admin_user(user_id)
-    if not is_admin and await is_active_subscription(
-        user_id, notify_user_about_cleanup=True
-    ):
-        await show_active_subscription_guard(event)
-        return
+    if not is_admin:
+        await db.add_user(user_id)
+        state = await ensure_subscription_state(user_id, notify_user_about_cleanup=True)
+        if state.get("status") == "active" and not is_expiring_soon(state, days=3):
+            await show_active_subscription_guard(event)
+            return
 
     plans = await get_visible_plans(user_id, for_admin=is_admin)
     text = build_buy_text(plans, for_admin=is_admin)
 
-    keyboard = [[{"text": "Наши тарифы", "callback_data": "subs"}]]
+    keyboard = [
+        [
+            {
+                "text": translate(DEFAULT_LANGUAGE, "buttons.tariffs"),
+                "callback_data": "subs",
+            }
+        ]
+    ]
     if is_admin:
         for plan in plans:
             keyboard.append(
                 [
                     {
-                        "text": f"Тест {plan.get('name', plan.get('id'))}",
+                        "text": translate(
+                            DEFAULT_LANGUAGE,
+                            "buttons.test_plan",
+                            plan_name=plan.get("name", plan.get("id")),
+                        ),
                         "callback_data": f"test:{plan.get('id')}",
                     }
                 ]
@@ -3246,10 +3996,20 @@ async def cmd_buy(event):
                 )
 
     if custom_tariff_enabled():
-        custom_button_text = "Кастомный тариф (тест)" if is_admin else "Кастомный тариф"
+        custom_button_text = translate(
+            DEFAULT_LANGUAGE,
+            "buttons.custom_tariff_test" if is_admin else "buttons.custom_tariff",
+        )
         keyboard.append([{"text": custom_button_text, "callback_data": "custom:start"}])
 
-    keyboard.append([{"text": "Главная", "callback_data": "start"}])
+    keyboard.append(
+        [
+            {
+                "text": translate(DEFAULT_LANGUAGE, "buttons.main"),
+                "callback_data": "start",
+            }
+        ]
+    )
 
     await smart_answer(event, text, reply_markup=kb(keyboard), delete_origin=True)
 
@@ -3260,16 +4020,17 @@ async def cmd_custom_start(event: CallbackQuery, state: FSMContext):
         return
 
     user_id = event.from_user.id
-    await db.add_user(user_id)
-    if not is_admin_user(user_id) and await is_active_subscription(
-        user_id, notify_user_about_cleanup=True
-    ):
-        await show_active_subscription_guard(event)
-        return
+    is_admin = is_admin_user(user_id)
+    if not is_admin:
+        await db.add_user(user_id)
+        state = await ensure_subscription_state(user_id, notify_user_about_cleanup=True)
+        if state.get("status") == "active" and not is_expiring_soon(state, days=3):
+            await show_active_subscription_guard(event)
+            return
     if not get_custom_locations():
         await smart_answer(
             event,
-            "❌ Кастомный тариф временно недоступен: локации не настроены.",
+            translate(DEFAULT_LANGUAGE, "texts.custom_tariff_unavailable_locations"),
             reply_markup=main_menu_keyboard(),
             delete_origin=True,
         )
@@ -3280,9 +4041,12 @@ async def cmd_custom_start(event: CallbackQuery, state: FSMContext):
     await state.set_state(CustomTariffState.waiting_for_gb)
     await smart_answer(
         event,
-        "<b>Кастомный тариф</b>\n\n"
-        f"Шаг 1/4: введите объём трафика в ГБ ({min_gb}-{max_gb}).\n"
-        "Пример: <code>500</code>",
+        translate(
+            DEFAULT_LANGUAGE,
+            "texts.custom_tariff_step_gb",
+            min_gb=min_gb,
+            max_gb=max_gb,
+        ),
         reply_markup=cancel_only_keyboard(),
         delete_origin=True,
     )
@@ -3301,7 +4065,7 @@ async def process_custom_gb(event: Message, state: FSMContext):
 
     if not text_value.isdigit():
         await event.answer(
-            "❌ Значение трафика должно быть целым числом в ГБ.",
+            translate(DEFAULT_LANGUAGE, "texts.custom_tariff_invalid_gb"),
             reply_markup=cancel_only_keyboard(),
         )
         return
@@ -3310,7 +4074,12 @@ async def process_custom_gb(event: Message, state: FSMContext):
     min_gb, max_gb = custom_gb_bounds()
     if not (min_gb <= traffic_gb <= max_gb):
         await event.answer(
-            f"❌ Трафик должен быть в диапазоне {min_gb}-{max_gb} ГБ.",
+            translate(
+                DEFAULT_LANGUAGE,
+                "texts.custom_tariff_invalid_gb_range",
+                min_gb=min_gb,
+                max_gb=max_gb,
+            ),
             reply_markup=cancel_only_keyboard(),
         )
         return
@@ -3319,9 +4088,12 @@ async def process_custom_gb(event: Message, state: FSMContext):
     await state.update_data(custom_traffic_gb=traffic_gb)
     await state.set_state(CustomTariffState.waiting_for_ip)
     await event.answer(
-        "<b>Кастомный тариф</b>\n\n"
-        f"Шаг 2/4: введите лимит IP ({min_ip}-{max_ip}).\n"
-        "Пример: <code>3</code>",
+        translate(
+            DEFAULT_LANGUAGE,
+            "texts.custom_tariff_step_ip",
+            min_ip=min_ip,
+            max_ip=max_ip,
+        ),
         reply_markup=cancel_only_keyboard(),
     )
 
@@ -3339,7 +4111,7 @@ async def process_custom_ip(event: Message, state: FSMContext):
 
     if not text_value.isdigit():
         await event.answer(
-            "❌ Лимит IP должен быть целым числом.",
+            translate(DEFAULT_LANGUAGE, "texts.custom_tariff_invalid_ip"),
             reply_markup=cancel_only_keyboard(),
         )
         return
@@ -3348,7 +4120,12 @@ async def process_custom_ip(event: Message, state: FSMContext):
     min_ip, max_ip = custom_ip_bounds()
     if not (min_ip <= ip_limit <= max_ip):
         await event.answer(
-            f"❌ Лимит IP должен быть в диапазоне {min_ip}-{max_ip}.",
+            translate(
+                DEFAULT_LANGUAGE,
+                "texts.custom_tariff_invalid_ip_range",
+                min_ip=min_ip,
+                max_ip=max_ip,
+            ),
             reply_markup=cancel_only_keyboard(),
         )
         return
@@ -3357,9 +4134,12 @@ async def process_custom_ip(event: Message, state: FSMContext):
     await state.update_data(custom_ip_limit=ip_limit)
     await state.set_state(CustomTariffState.waiting_for_days)
     await event.answer(
-        "<b>Кастомный тариф</b>\n\n"
-        f"Шаг 3/4: введите срок подписки в днях ({min_days}-{max_days}).\n"
-        "Пример: <code>30</code>",
+        translate(
+            DEFAULT_LANGUAGE,
+            "texts.custom_tariff_step_days",
+            min_days=min_days,
+            max_days=max_days,
+        ),
         reply_markup=cancel_only_keyboard(),
     )
 
@@ -3377,7 +4157,7 @@ async def process_custom_days(event: Message, state: FSMContext):
 
     if not text_value.isdigit():
         await event.answer(
-            "❌ Срок должен быть целым числом дней.",
+            translate(DEFAULT_LANGUAGE, "texts.custom_tariff_invalid_duration"),
             reply_markup=cancel_only_keyboard(),
         )
         return
@@ -3386,7 +4166,12 @@ async def process_custom_days(event: Message, state: FSMContext):
     min_days, max_days = custom_days_bounds()
     if not (min_days <= duration_days <= max_days):
         await event.answer(
-            f"❌ Срок должен быть в диапазоне {min_days}-{max_days} дней.",
+            translate(
+                DEFAULT_LANGUAGE,
+                "texts.custom_tariff_invalid_duration_range",
+                min_days=min_days,
+                max_days=max_days,
+            ),
             reply_markup=cancel_only_keyboard(),
         )
         return
@@ -3397,7 +4182,7 @@ async def process_custom_days(event: Message, state: FSMContext):
     if not is_valid_custom_limits(traffic_gb, ip_limit, duration_days):
         await state.clear()
         await event.answer(
-            "❌ Не удалось сформировать кастомный тариф. Начните заново.",
+            translate(DEFAULT_LANGUAGE, "texts.custom_tariff_invalid_limits"),
             reply_markup=main_menu_keyboard(),
             delete_origin=True,
         )
@@ -3420,7 +4205,7 @@ async def process_custom_locations_text(event: Message, state: FSMContext):
         return
 
     await event.answer(
-        "Выберите локации кнопками в сообщении выше или нажмите <b>Отмена</b>.",
+        translate(DEFAULT_LANGUAGE, "texts.custom_tariff_select_locations"),
         reply_markup=cancel_only_keyboard(),
     )
 
@@ -3434,7 +4219,10 @@ async def cmd_custom_toggle_location(event: CallbackQuery, state: FSMContext):
 
     code = normalize_server_code(event.data.rsplit(":", 1)[-1])
     if not get_location_by_code(code):
-        await event.answer("❌ Локация недоступна", show_alert=True)
+        await event.answer(
+            translate(DEFAULT_LANGUAGE, "texts.custom_tariff_location_unavailable"),
+            show_alert=True,
+        )
         return
 
     data = await state.get_data()
@@ -3458,7 +4246,10 @@ async def cmd_custom_locations_done(event: CallbackQuery, state: FSMContext):
     data = await state.get_data()
     selected = normalize_servers(data.get("custom_servers"))
     if not selected:
-        await event.answer("Выберите хотя бы одну локацию.", show_alert=True)
+        await event.answer(
+            translate(DEFAULT_LANGUAGE, "texts.custom_tariff_choose_location_count"),
+            show_alert=True,
+        )
         return
 
     await show_custom_summary(event, state)
@@ -3476,7 +4267,7 @@ async def process_custom_confirm_text(event: Message, state: FSMContext):
         return
 
     await event.answer(
-        "Используйте кнопки в сообщении выше или нажмите <b>Отмена</b>.",
+        translate(DEFAULT_LANGUAGE, "texts.custom_tariff_use_buttons_or_cancel"),
         reply_markup=cancel_only_keyboard(),
     )
 
@@ -3487,33 +4278,39 @@ async def process_custom_confirm_text(event: Message, state: FSMContext):
 async def cmd_custom_show_offer(event: CallbackQuery, state: FSMContext):
     if not await ensure_custom_tariff_access(event, state):
         return
-
     parts = event.data.split(":")
     if len(parts) < 3:
-        await event.answer("❌ Ошибка обработки запроса", show_alert=True)
+        await event.answer(
+            translate(DEFAULT_LANGUAGE, "texts.request_processing_error"),
+            show_alert=True,
+        )
         return
 
     try:
         user_id = int(parts[2])
     except ValueError:
         await event.answer(
-            "❌ Некорректный идентификатор пользователя", show_alert=True
+            translate(DEFAULT_LANGUAGE, "texts.invalid_user_identifier"),
+            show_alert=True,
         )
         return
 
     if user_id != event.from_user.id:
-        await event.answer("❌ Ошибка: неверный пользователь", show_alert=True)
+        await event.answer(
+            translate(DEFAULT_LANGUAGE, "texts.wrong_user_error"), show_alert=True
+        )
         return
 
     if is_admin_user(user_id):
         await event.answer(
-            "Для администраторов этот шаг не требуется.", show_alert=True
+            translate(DEFAULT_LANGUAGE, "texts.admin_step_not_required"),
+            show_alert=True,
         )
         return
 
     await show_offer_agreement(
         event,
-        continue_callback_data=f"custom:show_payment:{user_id}",
+        continue_callback_data=f"custom:choose_payment_method:{user_id}",
     )
 
 
@@ -3526,28 +4323,37 @@ async def cmd_custom_show_payment(event: CallbackQuery, state: FSMContext):
 
     parts = event.data.split(":")
     if len(parts) < 3:
-        await event.answer("❌ Ошибка обработки запроса", show_alert=True)
+        await event.answer(
+            translate(DEFAULT_LANGUAGE, "texts.request_processing_error"),
+            show_alert=True,
+        )
         return
 
     try:
         user_id = int(parts[2])
     except ValueError:
         await event.answer(
-            "❌ Некорректный идентификатор пользователя", show_alert=True
+            translate(DEFAULT_LANGUAGE, "texts.invalid_user_identifier"),
+            show_alert=True,
         )
         return
 
     if user_id != event.from_user.id:
-        await event.answer("❌ Ошибка: неверный пользователь", show_alert=True)
+        await event.answer(
+            translate(DEFAULT_LANGUAGE, "texts.wrong_user_error"),
+            show_alert=True,
+        )
         return
 
     if is_admin_user(user_id):
         await event.answer(
-            "Для администраторов этот шаг не требуется.", show_alert=True
+            translate(DEFAULT_LANGUAGE, "texts.admin_step_not_required"),
+            show_alert=True,
         )
         return
 
-    if await is_active_subscription(user_id, notify_user_about_cleanup=True):
+    state = await ensure_subscription_state(user_id, notify_user_about_cleanup=True)
+    if state.get("status") == "active" and not is_expiring_soon(state, days=3):
         await state.clear()
         await show_active_subscription_guard(event)
         return
@@ -3568,7 +4374,7 @@ async def cmd_custom_show_payment(event: CallbackQuery, state: FSMContext):
         await state.clear()
         await smart_answer(
             event,
-            "❌ Не удалось подготовить платеж. Создайте кастомный тариф заново.",
+            translate(DEFAULT_LANGUAGE, "texts.custom_tariff_payment_prepare_failed"),
             reply_markup=main_menu_keyboard(),
             delete_origin=True,
         )
@@ -3577,42 +4383,245 @@ async def cmd_custom_show_payment(event: CallbackQuery, state: FSMContext):
     if not plan_name:
         plan_name = build_custom_plan_name(traffic_gb, ip_limit, duration_days, servers)
 
-    text = (
-        "<b>Оплата кастомного тарифа</b>\n\n"
-        f"Тариф: <b>{plan_name}</b>\n"
-        f"Локации: <b>{format_servers(servers)}</b>\n"
-        f"Сумма к оплате: <b>{amount} ₽</b>\n\n"
-        f"Переведите {amount} ₽ по номеру карты: <code>{Config.PAYMENT_CARD_NUMBER}</code>.\n\n"
-        "После перевода нажмите кнопку подтверждения."
+    text = translate(
+        DEFAULT_LANGUAGE,
+        "texts.custom_tariff_payment_details",
+        plan_name=plan_name,
+        servers=format_servers(servers),
+        amount=amount,
+        payment_card=Config.PAYMENT_CARD_NUMBER,
     )
     keyboard = kb(
         [
             [
                 {
-                    "text": "Подтвердить оплату",
+                    "text": translate(DEFAULT_LANGUAGE, "buttons.confirm_payment"),
                     "callback_data": "custom:confirm_payment",
                 }
             ],
-            [{"text": "Отмена", "callback_data": "cancel"}],
+            [
+                {
+                    "text": translate(DEFAULT_LANGUAGE, "buttons.cancel"),
+                    "callback_data": "cancel",
+                }
+            ],
         ]
     )
     await smart_answer(event, text, reply_markup=keyboard, delete_origin=True)
 
 
 @router.callback_query(
-    CustomTariffState.waiting_for_confirm, F.data == "custom:confirm_payment"
+    CustomTariffState.waiting_for_confirm,
+    F.data.startswith("custom:choose_payment_method:"),
+)
+async def cmd_custom_choose_payment_method(event: CallbackQuery, state: FSMContext):
+    parts = event.data.split(":")
+    if len(parts) < 3:
+        await event.answer(
+            translate(DEFAULT_LANGUAGE, "texts.request_processing_error"),
+            show_alert=True,
+        )
+        return
+    try:
+        user_id = int(parts[2])
+    except ValueError:
+        await event.answer(
+            translate(DEFAULT_LANGUAGE, "texts.invalid_user_identifier"),
+            show_alert=True,
+        )
+        return
+
+    if user_id != event.from_user.id:
+        await event.answer(
+            translate(DEFAULT_LANGUAGE, "texts.wrong_user_error"), show_alert=True
+        )
+        return
+
+    text = translate(DEFAULT_LANGUAGE, "texts.choose_payment_method")
+    keyboard = [
+        [
+            {
+                "text": translate(DEFAULT_LANGUAGE, "buttons.payment_method_yoomoney"),
+                "callback_data": f"custom:pay_yoomoney:{user_id}",
+            },
+            {
+                "text": translate(DEFAULT_LANGUAGE, "buttons.payment_method_p2p"),
+                "callback_data": f"custom:pay_p2p:{user_id}",
+            },
+        ],
+        [
+            {
+                "text": translate(DEFAULT_LANGUAGE, "buttons.cancel"),
+                "callback_data": "cancel",
+            }
+        ],
+    ]
+    await smart_answer(event, text, reply_markup=kb(keyboard), delete_origin=True)
+
+
+@router.callback_query(
+    CustomTariffState.waiting_for_confirm, F.data.startswith("custom:pay_yoomoney:")
+)
+async def cmd_custom_show_yoomoney(event: CallbackQuery, state: FSMContext):
+    parts = event.data.split(":")
+    try:
+        user_id = int(parts[2])
+    except ValueError:
+        await event.answer(
+            translate(DEFAULT_LANGUAGE, "texts.invalid_user_identifier"),
+            show_alert=True,
+        )
+        return
+
+    if user_id != event.from_user.id:
+        await event.answer(
+            translate(DEFAULT_LANGUAGE, "texts.wrong_user_error"), show_alert=True
+        )
+        return
+
+    data = await state.get_data()
+    amount = to_int(data.get("custom_final_amount"), -1)
+    plan_name = str(data.get("custom_plan_name") or " ").strip()
+
+    if amount < 0:
+        await state.clear()
+        await smart_answer(
+            event,
+            translate(DEFAULT_LANGUAGE, "texts.custom_tariff_payment_prepare_failed"),
+            reply_markup=main_menu_keyboard(),
+            delete_origin=True,
+        )
+        return
+
+    order_id = f"{user_id}_{uuid.uuid4().hex[:8]}"
+    params = {
+        "receiver": Config.YOOMONEY_WALLET,
+        "quickpay-form": "shop",
+        "targets": f"VPN Custom #{order_id}",
+        "paymentType": "AC",
+        "sum": amount,
+        "label": order_id,
+    }
+    payment_url = "https://yoomoney.ru/quickpay/confirm?" + urlencode(params)
+
+    text = translate(
+        DEFAULT_LANGUAGE,
+        "texts.yoomoney_payment_details",
+        plan_name=plan_name,
+        amount=amount,
+    )
+    keyboard = [
+        [{"text": "🔗 Оплатить через ЮMoney", "url": payment_url}],
+        [
+            {
+                "text": translate(DEFAULT_LANGUAGE, "buttons.confirm_payment"),
+                "callback_data": f"custom:confirm_payment:yoomoney:{user_id}",
+            }
+        ],
+        [
+            {
+                "text": translate(DEFAULT_LANGUAGE, "buttons.cancel"),
+                "callback_data": "cancel",
+            }
+        ],
+    ]
+    await smart_answer(event, text, reply_markup=kb(keyboard), delete_origin=True)
+
+
+@router.callback_query(
+    CustomTariffState.waiting_for_confirm, F.data.startswith("custom:pay_p2p:")
+)
+async def cmd_custom_show_p2p(event: CallbackQuery, state: FSMContext):
+    parts = event.data.split(":")
+    try:
+        user_id = int(parts[2])
+    except ValueError:
+        await event.answer(
+            translate(DEFAULT_LANGUAGE, "texts.invalid_user_identifier"),
+            show_alert=True,
+        )
+        return
+
+    if user_id != event.from_user.id:
+        await event.answer(
+            translate(DEFAULT_LANGUAGE, "texts.wrong_user_error"), show_alert=True
+        )
+        return
+
+    data = await state.get_data()
+    amount = to_int(data.get("custom_final_amount"), -1)
+    plan_name = str(data.get("custom_plan_name") or " ").strip()
+    servers = normalize_servers(data.get("custom_servers"))
+
+    if amount < 0:
+        await state.clear()
+        await smart_answer(
+            event,
+            translate(DEFAULT_LANGUAGE, "texts.custom_tariff_payment_prepare_failed"),
+            reply_markup=main_menu_keyboard(),
+            delete_origin=True,
+        )
+        return
+
+    text = translate(
+        DEFAULT_LANGUAGE,
+        "texts.p2p_payment_details",
+        plan_name=plan_name,
+        amount=amount,
+        payment_card=Config.PAYMENT_CARD_NUMBER,
+    )
+    keyboard = [
+        [
+            {
+                "text": translate(DEFAULT_LANGUAGE, "buttons.confirm_payment"),
+                "callback_data": f"custom:confirm_payment:p2p:{user_id}",
+            }
+        ],
+        [
+            {
+                "text": translate(DEFAULT_LANGUAGE, "buttons.cancel"),
+                "callback_data": "cancel",
+            }
+        ],
+    ]
+    await smart_answer(event, text, reply_markup=kb(keyboard), delete_origin=True)
+
+
+@router.callback_query(
+    CustomTariffState.waiting_for_confirm, F.data.startswith("custom:confirm_payment:")
 )
 async def cmd_custom_confirm_payment(event: CallbackQuery, state: FSMContext):
     if not await ensure_custom_tariff_access(event, state):
         return
 
-    user_id = event.from_user.id
-    if not is_admin_user(user_id) and await is_active_subscription(
-        user_id, notify_user_about_cleanup=True
-    ):
-        await state.clear()
-        await show_active_subscription_guard(event)
+    parts = event.data.split(":")
+    if len(parts) < 4:
+        await event.answer(
+            translate(DEFAULT_LANGUAGE, "texts.request_processing_error"),
+            show_alert=True,
+        )
         return
+
+    payment_method = parts[2]
+    try:
+        user_id = int(parts[3])
+    except ValueError:
+        await event.answer(
+            translate(DEFAULT_LANGUAGE, "texts.invalid_user_identifier"),
+            show_alert=True,
+        )
+        return
+
+    if not is_admin_user(user_id):
+        state_check = await ensure_subscription_state(
+            user_id, notify_user_about_cleanup=True
+        )
+        if state_check.get("status") == "active" and not is_expiring_soon(
+            state_check, days=3
+        ):
+            await state.clear()
+            await show_active_subscription_guard(event)
+            return
 
     data = await state.get_data()
     traffic_gb = to_int(data.get("custom_traffic_gb"), 0)
@@ -3621,7 +4630,7 @@ async def cmd_custom_confirm_payment(event: CallbackQuery, state: FSMContext):
     servers = normalize_servers(data.get("custom_servers"))
     amount = to_int(data.get("custom_final_amount"), -1)
     base_amount = to_int(data.get("custom_base_amount"), -1)
-    plan_name = str(data.get("custom_plan_name") or "").strip()
+    plan_name = str(data.get("custom_plan_name") or " ").strip()
 
     if (
         amount < 0
@@ -3632,7 +4641,7 @@ async def cmd_custom_confirm_payment(event: CallbackQuery, state: FSMContext):
         await state.clear()
         await smart_answer(
             event,
-            "❌ Не удалось подготовить платеж. Создайте кастомный тариф заново.",
+            translate(DEFAULT_LANGUAGE, "texts.custom_tariff_payment_prepare_failed"),
             reply_markup=main_menu_keyboard(),
             delete_origin=True,
         )
@@ -3643,40 +4652,49 @@ async def cmd_custom_confirm_payment(event: CallbackQuery, state: FSMContext):
 
     if is_admin_user(user_id):
         custom_plan = build_custom_plan(
-            traffic_gb,
-            ip_limit,
-            duration_days,
-            servers=servers,
-            plan_name=plan_name,
+            traffic_gb, ip_limit, duration_days, servers=servers, plan_name=plan_name
         )
         vpn_url = await create_subscription(
             user_id,
             custom_plan,
-            plan_suffix=" (тест)",
+            plan_suffix=translate(DEFAULT_LANGUAGE, "texts.test_plan_suffix"),
             earn_trust=False,
         )
         await state.clear()
 
         if vpn_url:
-            text = (
-                "<b>Тестовая подписка создана</b>\n\n"
-                f"Тариф: <b>{plan_name} (тест)</b>\n"
-                f"Устройства: <b>до {ip_limit}</b>\n"
-                f"Трафик: <b>{format_traffic(traffic_gb)}</b>\n"
-                f"Локации: <b>{format_servers(servers)}</b>\n"
-                f"Срок: <b>{format_duration(duration_days)}</b>\n\n"
-                f"URL для подключения:\n<code>{vpn_url}</code>"
+            text = translate(
+                DEFAULT_LANGUAGE,
+                "texts.custom_test_subscription_created",
+                plan_name=plan_name,
+                ip_limit=ip_limit,
+                traffic=format_traffic(traffic_gb),
+                servers=format_servers(servers),
+                duration=format_duration(duration_days),
+                vpn_url=vpn_url,
             )
         else:
-            text = "❌ Не удалось создать тестовую подписку."
+            text = translate(DEFAULT_LANGUAGE, "texts.test_subscription_failed")
 
         await smart_answer(
             event,
             text,
             reply_markup=kb(
                 [
-                    [{"text": "Моя подписка", "callback_data": "mysub"}],
-                    [{"text": "Главная", "callback_data": "start"}],
+                    [
+                        {
+                            "text": translate(
+                                DEFAULT_LANGUAGE, "buttons.my_subscription"
+                            ),
+                            "callback_data": "mysub",
+                        }
+                    ],
+                    [
+                        {
+                            "text": translate(DEFAULT_LANGUAGE, "buttons.main"),
+                            "callback_data": "start",
+                        }
+                    ],
                 ]
             ),
             delete_origin=True,
@@ -3693,6 +4711,7 @@ async def cmd_custom_confirm_payment(event: CallbackQuery, state: FSMContext):
         "amount": amount,
         "timestamp": datetime.now().isoformat(),
         "status": "pending",
+        "payment_method": payment_method,
         "custom_plan": {
             "traffic_gb": traffic_gb,
             "ip_limit": ip_limit,
@@ -3708,8 +4727,7 @@ async def cmd_custom_confirm_payment(event: CallbackQuery, state: FSMContext):
     if not added:
         await smart_answer(
             event,
-            "У вас уже есть заявка на подтверждение платежа.\n\n"
-            "Дождитесь проверки администратором.",
+            translate(DEFAULT_LANGUAGE, "texts.payment_request_already_exists"),
             reply_markup=main_menu_keyboard(),
             delete_origin=True,
         )
@@ -3717,8 +4735,7 @@ async def cmd_custom_confirm_payment(event: CallbackQuery, state: FSMContext):
 
     await smart_answer(
         event,
-        "<b>Запрос на подтверждение платежа по кастомному тарифу получен.</b>\n\n"
-        "После проверки платежа вы получите уведомление о статусе подписки.",
+        translate(DEFAULT_LANGUAGE, "texts.custom_payment_request_received"),
         reply_markup=main_menu_keyboard(),
         delete_origin=True,
     )
@@ -3728,17 +4745,20 @@ async def cmd_custom_confirm_payment(event: CallbackQuery, state: FSMContext):
 async def cmd_custom_unknown(event: CallbackQuery, state: FSMContext):
     if not await ensure_custom_tariff_access(event, state):
         return
-    await event.answer("❌ Неизвестная команда кастомного тарифа.", show_alert=True)
+    await event.answer(
+        translate(DEFAULT_LANGUAGE, "texts.custom_tariff_unknown_command"),
+        show_alert=True,
+    )
 
 
 @router.callback_query(F.data.startswith("buy:"))
 async def cmd_buy_plan(event: CallbackQuery):
     user_id = event.from_user.id
-    if not is_admin_user(user_id) and await is_active_subscription(
-        user_id, notify_user_about_cleanup=True
-    ):
-        await show_active_subscription_guard(event)
-        return
+    if not is_admin_user(user_id):
+        state = await ensure_subscription_state(user_id, notify_user_about_cleanup=True)
+        if state.get("status") == "active" and not is_expiring_soon(state, days=3):
+            await show_active_subscription_guard(event)
+            return
 
     plan_id = event.data.split(":", 1)[1]
     plan, error = get_purchasable_catalog_plan(plan_id)
@@ -3755,29 +4775,31 @@ async def cmd_buy_plan(event: CallbackQuery):
 async def show_offer_agreement(
     event: CallbackQuery, *, continue_callback_data: str
 ) -> None:
-    """Показывает окно с публичной офертой и кнопкой согласия."""
-    text = (
-        "<b>Подтвердите согласие с публичной офертой</b>\n\n"
-        "Перед продолжением оплаты ознакомьтесь с публичной офертой и подтвердите согласие."
-    )
-
+    text = translate(DEFAULT_LANGUAGE, "texts.offer_agreement")
     keyboard: List[List[Dict[str, str]]] = []
     if Config.PUBLIC_OFFER_URL:
         keyboard.append(
             [
                 {
-                    "text": "Публичная оферта",
+                    "text": translate(DEFAULT_LANGUAGE, "buttons.public_offer"),
                     "url": Config.PUBLIC_OFFER_URL,
                 }
             ]
         )
 
+    target_method_callback = continue_callback_data.replace(
+        "show_payment:", "choose_payment_method:"
+    ).replace("custom:show_payment:", "custom:choose_payment_method:")
+
     keyboard.append(
         [
-            {"text": "Отмена", "callback_data": "cancel"},
             {
-                "text": "Я согласен",
-                "callback_data": continue_callback_data,
+                "text": translate(DEFAULT_LANGUAGE, "buttons.cancel"),
+                "callback_data": "cancel",
+            },
+            {
+                "text": translate(DEFAULT_LANGUAGE, "buttons.i_agree"),
+                "callback_data": target_method_callback,
             },
         ]
     )
@@ -3787,10 +4809,12 @@ async def show_offer_agreement(
 
 @router.callback_query(F.data.startswith("show_payment:"))
 async def cmd_show_payment_details(event: CallbackQuery):
-    """Показывает реквизиты для оплаты и кнопку 'Подтвердить оплату'."""
     parts = event.data.split(":")
     if len(parts) < 3:
-        await event.answer("❌ Ошибка обработки запроса", show_alert=True)
+        await event.answer(
+            translate(DEFAULT_LANGUAGE, "texts.request_processing_error"),
+            show_alert=True,
+        )
         return
 
     plan_id = parts[1]
@@ -3798,12 +4822,16 @@ async def cmd_show_payment_details(event: CallbackQuery):
         user_id = int(parts[2])
     except ValueError:
         await event.answer(
-            "❌ Некорректный идентификатор пользователя", show_alert=True
+            translate(DEFAULT_LANGUAGE, "texts.invalid_user_identifier"),
+            show_alert=True,
         )
         return
 
     if user_id != event.from_user.id:
-        await event.answer("❌ Ошибка: неверный пользователь", show_alert=True)
+        await event.answer(
+            translate(DEFAULT_LANGUAGE, "texts.wrong_user_error"),
+            show_alert=True,
+        )
         return
 
     plan, error = get_purchasable_catalog_plan(plan_id)
@@ -3813,53 +4841,72 @@ async def cmd_show_payment_details(event: CallbackQuery):
 
     price = to_float(plan.get("price_rub", 0), 0.0)
     duration = int(plan.get("duration_days", 30))
+    price_value = int(price) if price.is_integer() else f"{price:.2f}"
     if duration == 30:
-        price_line = (
-            f"{int(price)} ₽/мес" if price.is_integer() else f"{price:.2f} ₽/мес"
+        price_line = translate(
+            DEFAULT_LANGUAGE, "texts.price_monthly", price=price_value
         )
     else:
-        price_line = (
-            f"{int(price)} ₽/{duration} дней"
-            if price.is_integer()
-            else f"{price:.2f} ₽/{duration} дней"
+        price_line = translate(
+            DEFAULT_LANGUAGE,
+            "texts.price_fixed_days",
+            price=price_value,
+            duration=duration,
         )
 
-    # Получить очки доверия и применить скидку
     trust_score = await db.get_trust_score(user_id)
     final_price, discount_percent = apply_trust_discount(price, trust_score)
     final_price_int = int(final_price)
 
-    # Построить текст с учётом скидки
-    text = (
-        "<b>Покупка тарифа VPN</b>\n\n"
-        f"Вы выбрали тариф <b>{plan.get('name', plan_id)}</b> за {price_line}.\n\n"
-    )
     servers = get_plan_servers(plan)
+    locations_line = ""
     if servers:
-        text += f"Локации: <b>{format_servers(servers)}</b>\n\n"
+        locations_line = translate(
+            DEFAULT_LANGUAGE,
+            "texts.catalog_payment_locations_line",
+            servers=format_servers(servers),
+        )
 
     if discount_percent > 0:
         original_price = int(price) if price.is_integer() else price
-        text += (
-            f"Итого (с учётом скидки): <s>{original_price} ₽</s> <b>{final_price_int} ₽</b> "
-            f"(скидка -{discount_percent}%)\n\n"
+        total_line = translate(
+            DEFAULT_LANGUAGE,
+            "texts.payment_total_with_discount",
+            original_price=original_price,
+            final_price=final_price_int,
+            discount_percent=discount_percent,
         )
     else:
-        text += f"Итого: <b>{int(price) if price.is_integer() else price} ₽</b>\n\n"
+        total_line = translate(
+            DEFAULT_LANGUAGE,
+            "texts.payment_total",
+            final_price=int(price) if price.is_integer() else price,
+        )
 
-    text += (
-        f"Для оплаты переведите {final_price_int} ₽ по номеру карты: <code>{Config.PAYMENT_CARD_NUMBER}</code>.\n"
-        "После оплаты нажмите кнопку ниже для подтверждения платежа."
+    text = translate(
+        DEFAULT_LANGUAGE,
+        "texts.catalog_payment_details",
+        plan_name=plan.get("name", plan_id),
+        price_line=price_line,
+        locations_line=locations_line,
+        total_line=total_line,
+        amount=final_price_int,
+        payment_card=Config.PAYMENT_CARD_NUMBER,
     )
 
     keyboard = [
         [
             {
-                "text": "Подтвердить оплату",
+                "text": translate(DEFAULT_LANGUAGE, "buttons.confirm_payment"),
                 "callback_data": f"confirm_payment:{plan_id}:{user_id}",
             }
         ],
-        [{"text": "Отмена", "callback_data": "cancel"}],
+        [
+            {
+                "text": translate(DEFAULT_LANGUAGE, "buttons.cancel"),
+                "callback_data": "cancel",
+            }
+        ],
     ]
 
     await smart_answer(event, text, reply_markup=kb(keyboard), delete_origin=True)
@@ -3870,7 +4917,8 @@ async def cmd_test_plan(event: CallbackQuery):
     user_id = event.from_user.id
     if not is_admin_user(user_id):
         await event.answer(
-            "⛔ Эта функция доступна только администраторам!", show_alert=True
+            translate(DEFAULT_LANGUAGE, "texts.admin_only_feature"),
+            show_alert=True,
         )
         return
 
@@ -3883,26 +4931,37 @@ async def cmd_test_plan(event: CallbackQuery):
     vpn_url = await create_subscription(
         user_id,
         plan,
-        plan_suffix=" (тест)",
+        plan_suffix=translate(DEFAULT_LANGUAGE, "texts.test_plan_suffix"),
         earn_trust=False,
     )
 
     if vpn_url:
-        text = (
-            "✅ <b>Тестовая подписка успешно создана!</b>\n\n"
-            f"Тариф: <b>{plan.get('name', plan_id)} (тест)</b>\n"
-            f"IP-адреса: <b>до {plan.get('ip_limit', 0)}</b>\n"
-            f"Трафик: <b>{format_traffic(plan.get('traffic_gb', 0))}</b>\n"
-            f"Локации: <b>{format_servers(plan.get('servers'))}</b>\n"
-            f"Срок: <b>{format_duration(int(plan.get('duration_days', 30)))}</b>\n\n"
-            f"URL для подключения:\n<code>{vpn_url}</code>"
+        text = translate(
+            DEFAULT_LANGUAGE,
+            "texts.test_subscription_created",
+            plan_name=plan.get("name", plan_id),
+            ip_limit=plan.get("ip_limit", 0),
+            traffic=format_traffic(plan.get("traffic_gb", 0)),
+            servers=format_servers(plan.get("servers")),
+            duration=format_duration(int(plan.get("duration_days", 30))),
+            vpn_url=vpn_url,
         )
     else:
-        text = "❌ <b>Ошибка создания тестовой подписки!</b>"
+        text = translate(DEFAULT_LANGUAGE, "texts.test_subscription_failed")
 
     keyboard = [
-        [{"text": "Моя подписка", "callback_data": "mysub"}],
-        [{"text": "Главная", "callback_data": "start"}],
+        [
+            {
+                "text": translate(DEFAULT_LANGUAGE, "buttons.my_subscription"),
+                "callback_data": "mysub",
+            }
+        ],
+        [
+            {
+                "text": translate(DEFAULT_LANGUAGE, "buttons.main"),
+                "callback_data": "start",
+            }
+        ],
     ]
 
     await smart_answer(event, text, reply_markup=kb(keyboard), delete_origin=True)
@@ -3913,7 +4972,8 @@ async def cmd_trial_plan(event: CallbackQuery):
     user_id = event.from_user.id
     if is_admin_user(user_id):
         await event.answer(
-            "⛔ Пробный тариф доступен только пользователям!", show_alert=True
+            translate(DEFAULT_LANGUAGE, "texts.trial_admin_not_allowed"),
+            show_alert=True,
         )
         return
     if await is_active_subscription(user_id, notify_user_about_cleanup=True):
@@ -3923,7 +4983,10 @@ async def cmd_trial_plan(event: CallbackQuery):
     plan_id = event.data.split(":", 1)[1] if ":" in event.data else "trial"
     plan = get_by_id(plan_id)
     if not plan or not plan.get("active", True) or not is_trial_plan(plan):
-        await event.answer("❌ Пробный тариф не найден или недоступен", show_alert=True)
+        await event.answer(
+            translate(DEFAULT_LANGUAGE, "texts.trial_plan_not_found"),
+            show_alert=True,
+        )
         return
 
     await db.add_user(user_id)
@@ -3932,10 +4995,20 @@ async def cmd_trial_plan(event: CallbackQuery):
     has_subscription = bool(user.get("has_subscription")) if user else False
 
     if trial_used or has_subscription:
-        text = "⚠️ Пробный тариф доступен только один раз для новых пользователей."
+        text = translate(DEFAULT_LANGUAGE, "texts.trial_used_or_has_subscription")
         keyboard = [
-            [{"text": "Моя подписка", "callback_data": "mysub"}],
-            [{"text": "Главная", "callback_data": "start"}],
+            [
+                {
+                    "text": translate(DEFAULT_LANGUAGE, "buttons.my_subscription"),
+                    "callback_data": "mysub",
+                }
+            ],
+            [
+                {
+                    "text": translate(DEFAULT_LANGUAGE, "buttons.main"),
+                    "callback_data": "start",
+                }
+            ],
         ]
         await smart_answer(event, text, reply_markup=kb(keyboard), delete_origin=True)
         return
@@ -3943,48 +5016,67 @@ async def cmd_trial_plan(event: CallbackQuery):
     vpn_url = await create_subscription(
         user_id,
         plan,
-        plan_suffix=" (пробный)",
+        plan_suffix=translate(DEFAULT_LANGUAGE, "texts.trial_plan_suffix"),
         earn_trust=False,
     )
 
     if vpn_url:
         await db.mark_trial_used(user_id)
-        text = (
-            "✅ <b>Пробная подписка успешно создана!</b>\n\n"
-            f"Тариф: <b>{plan.get('name', plan_id)} (пробный)</b>\n"
-            f"IP-адреса: <b>до {plan.get('ip_limit', 0)}</b>\n"
-            f"Трафик: <b>{format_traffic(plan.get('traffic_gb', 0))}</b>\n"
-            f"Локации: <b>{format_servers(plan.get('servers'))}</b>\n"
-            f"Срок: <b>{format_duration(int(plan.get('duration_days', 30)))}</b>\n\n"
-            f"URL для подключения:\n<code>{vpn_url}</code>"
+        text = translate(
+            DEFAULT_LANGUAGE,
+            "texts.trial_subscription_created",
+            plan_name=plan.get("name", plan_id),
+            ip_limit=plan.get("ip_limit", 0),
+            traffic=format_traffic(plan.get("traffic_gb", 0)),
+            servers=format_servers(plan.get("servers")),
+            duration=format_duration(int(plan.get("duration_days", 30))),
+            vpn_url=vpn_url,
         )
     else:
-        text = "❌ <b>Ошибка создания пробной подписки!</b>"
+        text = translate(DEFAULT_LANGUAGE, "texts.trial_subscription_failed")
 
     keyboard = [
-        [{"text": "Моя подписка", "callback_data": "mysub"}],
-        [{"text": "Главная", "callback_data": "start"}],
+        [
+            {
+                "text": translate(DEFAULT_LANGUAGE, "buttons.my_subscription"),
+                "callback_data": "mysub",
+            }
+        ],
+        [
+            {
+                "text": translate(DEFAULT_LANGUAGE, "buttons.main"),
+                "callback_data": "start",
+            }
+        ],
     ]
 
     await smart_answer(event, text, reply_markup=kb(keyboard), delete_origin=True)
 
 
-@router.callback_query(F.data.startswith("confirm_payment:"))
-async def cmd_confirm_payment(event: CallbackQuery):
+@router.callback_query(F.data.startswith("choose_payment_method:"))
+async def cmd_choose_payment_method(event: CallbackQuery):
     parts = event.data.split(":")
     if len(parts) < 3:
-        await event.answer("❌ Ошибка обработки платежа", show_alert=True)
+        await event.answer(
+            translate(DEFAULT_LANGUAGE, "texts.request_processing_error"),
+            show_alert=True,
+        )
         return
 
     plan_id = parts[1]
     try:
         user_id = int(parts[2])
-    except Exception:
-        await event.answer("❌ Ошибка обработки платежа", show_alert=True)
+    except ValueError:
+        await event.answer(
+            translate(DEFAULT_LANGUAGE, "texts.invalid_user_identifier"),
+            show_alert=True,
+        )
         return
 
     if user_id != event.from_user.id:
-        await event.answer("❌ Ошибка обработки платежа", show_alert=True)
+        await event.answer(
+            translate(DEFAULT_LANGUAGE, "texts.wrong_user_error"), show_alert=True
+        )
         return
 
     plan, error = get_purchasable_catalog_plan(plan_id)
@@ -3992,7 +5084,185 @@ async def cmd_confirm_payment(event: CallbackQuery):
         await event.answer(error, show_alert=True)
         return
 
-    if await is_active_subscription(user_id, notify_user_about_cleanup=True):
+    text = translate(DEFAULT_LANGUAGE, "texts.choose_payment_method")
+    keyboard = [
+        [
+            {
+                "text": translate(DEFAULT_LANGUAGE, "buttons.payment_method_yoomoney"),
+                "callback_data": f"pay_yoomoney:{plan_id}:{user_id}",
+            },
+            {
+                "text": translate(DEFAULT_LANGUAGE, "buttons.payment_method_p2p"),
+                "callback_data": f"pay_p2p:{plan_id}:{user_id}",
+            },
+        ],
+        [
+            {
+                "text": translate(DEFAULT_LANGUAGE, "buttons.cancel"),
+                "callback_data": "cancel",
+            }
+        ],
+    ]
+    await smart_answer(event, text, reply_markup=kb(keyboard), delete_origin=True)
+
+
+@router.callback_query(F.data.startswith("pay_yoomoney:"))
+async def cmd_show_yoomoney_payment(event: CallbackQuery):
+    parts = event.data.split(":")
+    plan_id = parts[1]
+    try:
+        user_id = int(parts[2])
+    except ValueError:
+        await event.answer(
+            translate(DEFAULT_LANGUAGE, "texts.invalid_user_identifier"),
+            show_alert=True,
+        )
+        return
+
+    if user_id != event.from_user.id:
+        await event.answer(
+            translate(DEFAULT_LANGUAGE, "texts.wrong_user_error"), show_alert=True
+        )
+        return
+
+    plan, error = get_purchasable_catalog_plan(plan_id)
+    if not plan:
+        await event.answer(error, show_alert=True)
+        return
+
+    price = to_float(plan.get("price_rub", 0), 0.0)
+    trust_score = await db.get_trust_score(user_id)
+    final_price, _ = apply_trust_discount(price, trust_score)
+    final_price_int = int(final_price)
+
+    order_id = f"{user_id}_{uuid.uuid4().hex[:8]}"
+    params = {
+        "receiver": Config.YOOMONEY_WALLET,
+        "quickpay-form": "shop",
+        "targets": f"VPN #{order_id}",
+        "paymentType": "AC",
+        "sum": final_price_int,
+        "label": order_id,
+    }
+    payment_url = "https://yoomoney.ru/quickpay/confirm?" + urlencode(params)
+
+    text = translate(
+        DEFAULT_LANGUAGE,
+        "texts.yoomoney_payment_details",
+        plan_name=plan.get("name", plan_id),
+        amount=final_price_int,
+    )
+    keyboard = [
+        [
+            {
+                "text": "🔗 Оплатить через ЮMoney",
+                "url": payment_url,
+            }
+        ],
+        [
+            {
+                "text": translate(DEFAULT_LANGUAGE, "buttons.confirm_payment"),
+                "callback_data": f"confirm_payment:yoomoney:{plan_id}:{user_id}",
+            }
+        ],
+        [
+            {
+                "text": translate(DEFAULT_LANGUAGE, "buttons.cancel"),
+                "callback_data": "cancel",
+            }
+        ],
+    ]
+    await smart_answer(event, text, reply_markup=kb(keyboard), delete_origin=True)
+
+
+@router.callback_query(F.data.startswith("pay_p2p:"))
+async def cmd_show_p2p_payment(event: CallbackQuery):
+    parts = event.data.split(":")
+    plan_id = parts[1]
+    try:
+        user_id = int(parts[2])
+    except ValueError:
+        await event.answer(
+            translate(DEFAULT_LANGUAGE, "texts.invalid_user_identifier"),
+            show_alert=True,
+        )
+        return
+
+    if user_id != event.from_user.id:
+        await event.answer(
+            translate(DEFAULT_LANGUAGE, "texts.wrong_user_error"), show_alert=True
+        )
+        return
+
+    plan, error = get_purchasable_catalog_plan(plan_id)
+    if not plan:
+        await event.answer(error, show_alert=True)
+        return
+
+    price = to_float(plan.get("price_rub", 0), 0.0)
+    trust_score = await db.get_trust_score(user_id)
+    final_price, _ = apply_trust_discount(price, trust_score)
+    final_price_int = int(final_price)
+
+    text = translate(
+        DEFAULT_LANGUAGE,
+        "texts.p2p_payment_details",
+        plan_name=plan.get("name", plan_id),
+        amount=final_price_int,
+        payment_card=Config.PAYMENT_CARD_NUMBER,
+    )
+    keyboard = [
+        [
+            {
+                "text": translate(DEFAULT_LANGUAGE, "buttons.confirm_payment"),
+                "callback_data": f"confirm_payment:p2p:{plan_id}:{user_id}",
+            }
+        ],
+        [
+            {
+                "text": translate(DEFAULT_LANGUAGE, "buttons.cancel"),
+                "callback_data": "cancel",
+            }
+        ],
+    ]
+    await smart_answer(event, text, reply_markup=kb(keyboard), delete_origin=True)
+
+
+@router.callback_query(F.data.startswith("confirm_payment:"))
+async def cmd_confirm_payment(event: CallbackQuery):
+    parts = event.data.split(":")
+    if len(parts) < 4:
+        await event.answer(
+            translate(DEFAULT_LANGUAGE, "texts.payment_processing_error"),
+            show_alert=True,
+        )
+        return
+
+    payment_method = parts[1]
+    plan_id = parts[2]
+    try:
+        user_id = int(parts[3])
+    except Exception:
+        await event.answer(
+            translate(DEFAULT_LANGUAGE, "texts.payment_processing_error"),
+            show_alert=True,
+        )
+        return
+
+    if user_id != event.from_user.id:
+        await event.answer(
+            translate(DEFAULT_LANGUAGE, "texts.payment_processing_error"),
+            show_alert=True,
+        )
+        return
+
+    plan, error = get_purchasable_catalog_plan(plan_id)
+    if not plan:
+        await event.answer(error, show_alert=True)
+        return
+
+    state = await ensure_subscription_state(user_id, notify_user_about_cleanup=True)
+    if state.get("status") == "active" and not is_expiring_soon(state, days=3):
         await show_active_subscription_guard(event)
         return
 
@@ -4010,23 +5280,32 @@ async def cmd_confirm_payment(event: CallbackQuery):
         "amount": amount,
         "timestamp": datetime.now().isoformat(),
         "status": "pending",
+        "payment_method": payment_method,
     }
 
     added = await json_db.add_pending_for_user(user_id, payment_data)
     if not added:
-        text = (
-            "🕒 У вас уже есть заявка на подтверждение платежа.\n\n"
-            "Дождитесь проверки администратором."
-        )
-        keyboard = [[{"text": "Главная", "callback_data": "start"}]]
+        text = translate(DEFAULT_LANGUAGE, "texts.payment_request_already_exists")
+        keyboard = [
+            [
+                {
+                    "text": translate(DEFAULT_LANGUAGE, "buttons.main"),
+                    "callback_data": "start",
+                }
+            ]
+        ]
         await smart_answer(event, text, reply_markup=kb(keyboard), delete_origin=True)
         return
 
-    text = (
-        "🕒 <b>Ваш запрос на подтверждение платежа получен!</b>\n\n"
-        "После проверки платежа вы получите уведомление о статусе вашей подписки."
-    )
-    keyboard = [[{"text": "Главная", "callback_data": "start"}]]
+    text = translate(DEFAULT_LANGUAGE, "texts.payment_request_received")
+    keyboard = [
+        [
+            {
+                "text": translate(DEFAULT_LANGUAGE, "buttons.main"),
+                "callback_data": "start",
+            }
+        ]
+    ]
     await smart_answer(event, text, reply_markup=kb(keyboard), delete_origin=True)
 
 
@@ -4036,16 +5315,19 @@ async def cmd_mysub(event):
     user_id = event.from_user.id
 
     if is_admin_user(user_id):
-        text = (
-            "👤 <b>Ваша подписка VPN</b>\n\n"
-            "Тариф: <b>Admin</b>\n"
-            "Остаток трафика: <b>Безлимит</b>\n"
-            "IP-адреса: <b>Безлимит</b>\n"
-            "Срок действия: <b>Безлимит</b>\n\n"
-            "URL для подключения:\n"
-            f"{Config.SUB_PANEL_BASE}Admin"
+        text = translate(
+            DEFAULT_LANGUAGE,
+            "texts.admin_subscription_info",
+            url=f"{Config.SUB_PANEL_BASE}Admin",
         )
-        keyboard = [[{"text": "Главная", "callback_data": "start"}]]
+        keyboard = [
+            [
+                {
+                    "text": translate(DEFAULT_LANGUAGE, "buttons.main"),
+                    "callback_data": "start",
+                }
+            ]
+        ]
         await smart_answer(event, text, reply_markup=kb(keyboard), delete_origin=True)
         return
 
@@ -4070,15 +5352,27 @@ async def cmd_mysub(event):
         return
 
     if not user_data or not normalize_sub_id(user_data.get("vpn_url")):
-        text = "👤 <b>Ваша подписка VPN</b>\n\nУ вас нет активной подписки."
+        text = translate(DEFAULT_LANGUAGE, "texts.no_active_subscription")
         keyboard = [
-            [{"text": "Купить подписку", "callback_data": "buy"}],
-            [{"text": "Главная", "callback_data": "start"}],
+            [
+                {
+                    "text": translate(DEFAULT_LANGUAGE, "buttons.buy"),
+                    "callback_data": "buy",
+                }
+            ],
+            [
+                {
+                    "text": translate(DEFAULT_LANGUAGE, "buttons.main"),
+                    "callback_data": "start",
+                }
+            ],
         ]
         await smart_answer(event, text, reply_markup=kb(keyboard), delete_origin=True)
         return
 
-    plan_text = user_data.get("plan_text", "Неизвестно")
+    plan_text = user_data.get(
+        "plan_text", translate(DEFAULT_LANGUAGE, "texts.unknown_plan")
+    )
     plan_servers = get_user_plan_servers(user_data)
     ip_limit = to_int(user_data.get("ip_limit"), 0)
     traffic_gb = max(0.0, to_float(user_data.get("traffic_gb"), 0.0))
@@ -4091,47 +5385,75 @@ async def cmd_mysub(event):
         max_expiry = to_int(state.get("max_expiry"), 0)
         if traffic_gb > 0:
             remaining_gb = max(0.0, traffic_gb - used_gb)
-            traffic_line = f"Остаток трафика: <b>{remaining_gb:.1f} ГБ из {traffic_gb:.0f} ГБ</b>\n"
+            traffic_line = translate(
+                DEFAULT_LANGUAGE,
+                "texts.subscription_traffic_remaining",
+                remaining_gb=f"{remaining_gb:.1f}",
+                total_gb=f"{traffic_gb:.0f}",
+            )
         else:
-            traffic_line = "Остаток трафика: <b>Безлимит</b>\n"
+            traffic_line = translate(
+                DEFAULT_LANGUAGE, "texts.subscription_traffic_unlimited"
+            )
 
         if max_expiry > 0:
             expiry_date = datetime.fromtimestamp(max_expiry / 1000).strftime(
                 "%d.%m.%Y %H:%M"
             )
         else:
-            expiry_date = "не указана"
+            expiry_date = translate(DEFAULT_LANGUAGE, "texts.not_specified")
 
-        text = (
-            "👤 <b>Ваша подписка VPN</b>\n\n"
-            f"Тариф: <b>{plan_text}</b>\n"
-            f"{traffic_line}"
-            f"IP-адреса: <b>до {ip_limit}</b>\n"
-            f"Локации: <b>{format_servers(plan_servers)}</b>\n"
-            f"Срок действия: <b>до {expiry_date}</b>\n\n"
-            f"Ваши очки доверия: <b>{trust_score}/100</b>\n"
-            f"Ваша скидка: <b>{discount_percent}%</b>\n\n"
-            "URL для подключения:\n"
-            f"<code>{sub_url}</code>"
+        text = translate(
+            DEFAULT_LANGUAGE,
+            "texts.subscription_active_details",
+            plan_text=plan_text,
+            traffic_line=traffic_line,
+            ip_limit=ip_limit,
+            servers=format_servers(plan_servers),
+            expiry_date=expiry_date,
+            trust_score=trust_score,
+            discount_percent=discount_percent,
+            sub_url=sub_url,
         )
     else:
-        text = (
-            "👤 <b>Ваша подписка VPN</b>\n\n"
-            f"Тариф: <b>{plan_text}</b>\n"
-            f"IP-адреса: <b>до {ip_limit}</b>\n"
-            f"Трафик: <b>{format_traffic(traffic_gb)}</b>\n"
-            f"Локации: <b>{format_servers(plan_servers)}</b>\n"
-            f"Ваши очки доверия: <b>{trust_score}/100</b>\n"
-            f"Ваша скидка: <b>{discount_percent}%</b>\n\n"
-            "URL для подключения:\n"
-            f"<code>{sub_url}</code>\n\n"
-            "<i>Статистика подписки временно недоступна, попробуйте позже.</i>"
+        text = translate(
+            DEFAULT_LANGUAGE,
+            "texts.subscription_inactive_details",
+            plan_text=plan_text,
+            ip_limit=ip_limit,
+            traffic=format_traffic(traffic_gb),
+            servers=format_servers(plan_servers),
+            trust_score=trust_score,
+            discount_percent=discount_percent,
+            sub_url=sub_url,
         )
 
     keyboard = [
-        [{"text": "Рефералка", "callback_data": "ref"}],
-        [{"text": "Главная", "callback_data": "start"}],
+        [
+            {
+                "text": translate(DEFAULT_LANGUAGE, "buttons.referral_system"),
+                "callback_data": "ref",
+            }
+        ],
     ]
+    if status == "active" and is_expiring_soon(state, days=3):
+        keyboard.insert(
+            0,
+            [
+                {
+                    "text": translate(DEFAULT_LANGUAGE, "buttons.renew_subscription"),
+                    "callback_data": "buy",
+                }
+            ],
+        )
+    keyboard.append(
+        [
+            {
+                "text": translate(DEFAULT_LANGUAGE, "buttons.main"),
+                "callback_data": "start",
+            }
+        ]
+    )
     await smart_answer(event, text, reply_markup=kb(keyboard), delete_origin=True)
 
 
@@ -4139,11 +5461,21 @@ async def cmd_mysub(event):
 @router.callback_query(F.data == "ref")
 async def cmd_ref(event):
     user_id = event.from_user.id
+    if is_admin_user(user_id):
+        await event.answer(translate("ru", "texts.admin_ref_notice"), show_alert=True)
+        return
     await db.add_user(user_id)
     ref_code = await db.ensure_ref_code(user_id)
     if not ref_code:
-        text = "❌ Не удалось сгенерировать реферальный код."
-        keyboard = [[{"text": "Главная", "callback_data": "start"}]]
+        text = translate(DEFAULT_LANGUAGE, "texts.no_ref_code")
+        keyboard = [
+            [
+                {
+                    "text": translate(DEFAULT_LANGUAGE, "buttons.main"),
+                    "callback_data": "start",
+                }
+            ]
+        ]
         await smart_answer(event, text, reply_markup=kb(keyboard), delete_origin=True)
         return
 
@@ -4152,14 +5484,22 @@ async def cmd_ref(event):
 
     link = get_ref_link(ref_code)
 
-    text = (
-        "🤝 <b>Реферальная система VPN</b>\n\n"
-        f"Ваш диплинк для приглашения друзей:\n<code>{link}</code>\n\n"
-        f"Всего приглашено: <b>{total_refs}</b>\n"
-        f"Оплатили подписку: <b>{paid_refs}</b>\n\n"
-        f"Бонус за приглашение: <b>{Config.REF_BONUS_DAYS} дней</b> вам и другу после первой оплаты."
+    text = translate(
+        DEFAULT_LANGUAGE,
+        "texts.referral_info",
+        link=link,
+        total_refs=total_refs,
+        paid_refs=paid_refs,
+        bonus_days=Config.REF_BONUS_DAYS,
     )
-    keyboard = [[{"text": "Главная", "callback_data": "start"}]]
+    keyboard = [
+        [
+            {
+                "text": translate(DEFAULT_LANGUAGE, "buttons.main"),
+                "callback_data": "start",
+            }
+        ]
+    ]
     await smart_answer(event, text, reply_markup=kb(keyboard), delete_origin=True)
 
 
@@ -4169,9 +5509,14 @@ async def cmd_ban(event, state: FSMContext):
     if not await ensure_admin_access(event):
         return
 
-    text = "⛔ <b>Введите ID пользователя для блокировки</b>"
+    text = translate(DEFAULT_LANGUAGE, "texts.ban_user_prompt")
     keyboard = [
-        [{"text": "Отмена", "callback_data": "cancel"}],
+        [
+            {
+                "text": translate(DEFAULT_LANGUAGE, "buttons.cancel"),
+                "callback_data": "cancel",
+            }
+        ],
     ]
     await smart_answer(event, text, reply_markup=kb(keyboard), delete_origin=True)
     await state.set_state(BanUserState.waiting_for_user_id)
@@ -4186,19 +5531,28 @@ async def process_ban_user_id(event: Message, state: FSMContext):
         return
 
     if not text_value.isdigit():
-        await event.answer("❌ ID пользователя должен быть числом! Попробуйте снова:")
+        await event.answer(translate(DEFAULT_LANGUAGE, "texts.invalid_user_id_number"))
         return
 
     user_id_to_ban = int(text_value)
 
     if is_admin_user(user_id_to_ban):
-        await event.answer("❌ Нельзя заблокировать администратора!")
+        await event.answer(translate(DEFAULT_LANGUAGE, "texts.cannot_ban_admin"))
         return
 
     await state.update_data(user_id_to_ban=user_id_to_ban)
-    text = f"⛔ <b>Введите причину блокировки для пользователя ID {user_id_to_ban}</b>"
+    text = translate(
+        DEFAULT_LANGUAGE,
+        "texts.ban_reason_prompt",
+        user_id=user_id_to_ban,
+    )
     keyboard = [
-        [{"text": "Отмена", "callback_data": "cancel"}],
+        [
+            {
+                "text": translate(DEFAULT_LANGUAGE, "buttons.cancel"),
+                "callback_data": "cancel",
+            }
+        ],
     ]
     await smart_answer(event, text, reply_markup=kb(keyboard), delete_origin=True)
     await state.set_state(BanUserState.waiting_for_ban_reason)
@@ -4225,28 +5579,45 @@ async def process_ban_reason(event: Message, state: FSMContext):
             user_id_to_ban, f"banned: {ban_reason}", notify_user_about_cleanup=False
         )
 
-        text = (
-            f"⛔ <b>Пользователь ID {user_id_to_ban} заблокирован по причине:</b>\n"
-            f"{ban_reason}"
+        text = translate(
+            DEFAULT_LANGUAGE,
+            "texts.user_banned",
+            user_id=user_id_to_ban,
+            reason=ban_reason,
         )
 
         try:
             await notify_user(
                 user_id_to_ban,
-                "⛔ <b>Ваш аккаунт заблокирован!</b>\n\n"
-                f"Причина: {ban_reason}\n\n"
-                "Ваши очки доверия были обнулены.\n\n"
-                "Если вы считаете, что это ошибка, пожалуйста, свяжитесь с поддержкой.",
+                translate(
+                    DEFAULT_LANGUAGE,
+                    "texts.user_ban_notification",
+                    reason=ban_reason,
+                ),
                 reply_markup=support_keyboard(include_main=True),
             )
         except Exception:
             pass
     else:
-        text = f"❌ <b>Ошибка при блокировке пользователя ID {user_id_to_ban}</b>"
+        text = translate(
+            DEFAULT_LANGUAGE,
+            "texts.user_ban_error",
+            user_id=user_id_to_ban,
+        )
 
     keyboard = [
-        [{"text": "Разблокировать", "callback_data": "unban"}],
-        [{"text": "Главная", "callback_data": "start"}],
+        [
+            {
+                "text": translate(DEFAULT_LANGUAGE, "buttons.unban_user"),
+                "callback_data": "unban",
+            }
+        ],
+        [
+            {
+                "text": translate(DEFAULT_LANGUAGE, "buttons.main"),
+                "callback_data": "start",
+            }
+        ],
     ]
     await smart_answer(event, text, reply_markup=kb(keyboard), delete_origin=True)
 
@@ -4257,9 +5628,14 @@ async def cmd_unban(event, state: FSMContext):
     if not await ensure_admin_access(event):
         return
 
-    text = "⛔ <b>Введите ID пользователя для разблокировки</b>"
+    text = translate(DEFAULT_LANGUAGE, "texts.unban_user_prompt")
     keyboard = [
-        [{"text": "Отмена", "callback_data": "cancel"}],
+        [
+            {
+                "text": translate(DEFAULT_LANGUAGE, "buttons.cancel"),
+                "callback_data": "cancel",
+            }
+        ],
     ]
     await smart_answer(event, text, reply_markup=kb(keyboard), delete_origin=True)
     await state.set_state(UnbanUserState.waiting_for_user_id)
@@ -4274,15 +5650,24 @@ async def process_unban_user_id(event: Message, state: FSMContext):
         return
 
     if not text_value.isdigit():
-        await event.answer("❌ ID пользователя должен быть числом! Попробуйте снова:")
+        await event.answer(translate(DEFAULT_LANGUAGE, "texts.invalid_user_id_number"))
         return
 
     user_id_to_unban = int(text_value)
     await state.update_data(user_id_to_unban=user_id_to_unban)
 
-    text = f"⛔ <b>Введите причину разблокировки для пользователя ID {user_id_to_unban}</b>"
+    text = translate(
+        DEFAULT_LANGUAGE,
+        "texts.unban_reason_prompt",
+        user_id=user_id_to_unban,
+    )
     keyboard = [
-        [{"text": "Отмена", "callback_data": "cancel"}],
+        [
+            {
+                "text": translate(DEFAULT_LANGUAGE, "buttons.cancel"),
+                "callback_data": "cancel",
+            }
+        ],
     ]
     await smart_answer(event, text, reply_markup=kb(keyboard), delete_origin=True)
     await state.set_state(UnbanUserState.waiting_for_unban_reason)
@@ -4304,24 +5689,39 @@ async def process_unban_reason(event: Message, state: FSMContext):
     await state.clear()
 
     if success:
-        text = (
-            f"✅ <b>Пользователь ID {user_id_to_unban} разблокирован по причине:</b>\n"
-            f"{unban_reason}"
+        text = translate(
+            DEFAULT_LANGUAGE,
+            "texts.user_unbanned",
+            user_id=user_id_to_unban,
+            reason=unban_reason,
         )
 
         try:
             await notify_user(
                 user_id_to_unban,
-                "✅ <b>Ваш аккаунт разблокирован!</b>\n\n"
-                f"Причина: {unban_reason}\n\n"
-                "Добро пожаловать обратно!",
+                translate(
+                    DEFAULT_LANGUAGE,
+                    "texts.user_unban_notification",
+                    reason=unban_reason,
+                ),
             )
         except Exception:
             pass
     else:
-        text = f"❌ <b>Ошибка при разблокировке пользователя ID {user_id_to_unban}</b>"
+        text = translate(
+            DEFAULT_LANGUAGE,
+            "texts.user_unban_error",
+            user_id=user_id_to_unban,
+        )
 
-    keyboard = [[{"text": "Главная", "callback_data": "start"}]]
+    keyboard = [
+        [
+            {
+                "text": translate(DEFAULT_LANGUAGE, "buttons.main"),
+                "callback_data": "start",
+            }
+        ]
+    ]
     await smart_answer(event, text, reply_markup=kb(keyboard), delete_origin=True)
 
 
@@ -4331,21 +5731,28 @@ async def cmd_broadcast(event, state: FSMContext):
     if not await ensure_admin_access(event):
         return
 
-    text = "📢 <b>Отправка уведомления</b>\n\nВыберите тип рассылки:"
+    text = translate(DEFAULT_LANGUAGE, "texts.broadcast_prompt")
     keyboard = [
         [
             {
-                "text": "Всем зарегистрированным (кроме заблокированных)",
+                "text": translate(DEFAULT_LANGUAGE, "buttons.broadcast_all_users"),
                 "callback_data": "broadcast_all",
             }
         ],
         [
             {
-                "text": "Только активным подписчикам",
+                "text": translate(
+                    DEFAULT_LANGUAGE, "buttons.broadcast_active_subscribers"
+                ),
                 "callback_data": "broadcast_active",
             }
         ],
-        [{"text": "Отмена", "callback_data": "cancel"}],
+        [
+            {
+                "text": translate(DEFAULT_LANGUAGE, "buttons.cancel"),
+                "callback_data": "cancel",
+            }
+        ],
     ]
     await smart_answer(event, text, reply_markup=kb(keyboard), delete_origin=True)
     await state.set_state(BroadcastState.waiting_for_broadcast_type)
@@ -4366,13 +5773,22 @@ async def process_broadcast_type(event: CallbackQuery, state: FSMContext):
     await state.update_data(broadcast_type=broadcast_type)
 
     type_text = (
-        "всем зарегистрированным (кроме заблокированных)"
+        translate(DEFAULT_LANGUAGE, "texts.broadcast_target_all")
         if broadcast_type == "broadcast_all"
-        else "активным подписчикам"
+        else translate(DEFAULT_LANGUAGE, "texts.broadcast_target_active")
     )
-    text = f"📢 <b>Отправка уведомления {type_text}</b>\n\nВведите текст сообщения:"
+    text = translate(
+        DEFAULT_LANGUAGE,
+        "texts.broadcast_message_prompt",
+        type_text=type_text,
+    )
     keyboard = [
-        [{"text": "Отмена", "callback_data": "cancel"}],
+        [
+            {
+                "text": translate(DEFAULT_LANGUAGE, "buttons.cancel"),
+                "callback_data": "cancel",
+            }
+        ],
     ]
     await smart_answer(event, text, reply_markup=kb(keyboard), delete_origin=True)
     await state.set_state(BroadcastState.waiting_for_message)
@@ -4380,16 +5796,15 @@ async def process_broadcast_type(event: CallbackQuery, state: FSMContext):
 
 @router.message(BroadcastState.waiting_for_message)
 async def process_broadcast_message(event: Message, state: FSMContext):
-    # Проверить что это текстовое сообщение
     if not event.text or not isinstance(event.text, str):
         await event.answer(
-            "❌ Для рассылки нужно отправить текстовое сообщение, а не стикер, фото или видео."
+            translate(DEFAULT_LANGUAGE, "texts.broadcast_message_must_be_text")
         )
         return
 
     text_value = event.text.strip()
     if not text_value:
-        await event.answer("❌ Текст рассылки не должен быть пустым.")
+        await event.answer(translate(DEFAULT_LANGUAGE, "texts.broadcast_text_required"))
         return
 
     if text_value.lower() in ("отмена", "cancel", "/cancel"):
@@ -4406,7 +5821,7 @@ async def process_broadcast_message(event: Message, state: FSMContext):
     elif broadcast_type == "broadcast_active":
         user_ids = await db.get_subscribed_user_ids()
     else:
-        await event.answer("❌ Ошибка: неизвестный тип рассылки")
+        await event.answer(translate(DEFAULT_LANGUAGE, "texts.broadcast_invalid_type"))
         await state.clear()
         return
 
@@ -4424,17 +5839,25 @@ async def process_broadcast_message(event: Message, state: FSMContext):
             failed_count += 1
 
     type_text = (
-        "всем зарегистрированным (кроме заблокированных)"
+        translate(DEFAULT_LANGUAGE, "texts.broadcast_target_all")
         if broadcast_type == "broadcast_all"
-        else "активным подписчикам"
+        else translate(DEFAULT_LANGUAGE, "texts.broadcast_target_active")
     )
-    text = (
-        f"📢 <b>Рассылка завершена</b>\n\n"
-        f"Тип: {type_text}\n"
-        f"Отправлено: {sent_count}\n"
-        f"Ошибок: {failed_count}"
+    text = translate(
+        DEFAULT_LANGUAGE,
+        "texts.broadcast_completed",
+        type_text=type_text,
+        sent_count=sent_count,
+        failed_count=failed_count,
     )
-    keyboard = [[{"text": "Главная", "callback_data": "start"}]]
+    keyboard = [
+        [
+            {
+                "text": translate(DEFAULT_LANGUAGE, "buttons.main"),
+                "callback_data": "start",
+            }
+        ]
+    ]
     await smart_answer(event, text, reply_markup=kb(keyboard), delete_origin=True)
 
 
@@ -4444,14 +5867,44 @@ async def cmd_debug_menu(event):
     if not await ensure_admin_access(event):
         return
 
-    text = "🔧 <b>Инструменты отладки</b>\n\nВыберите действие:"
+    text = translate(DEFAULT_LANGUAGE, "texts.debug_menu_prompt")
     keyboard = [
-        [{"text": "Заблокировать пользователя", "callback_data": "ban"}],
-        [{"text": "Разблокировать пользователя", "callback_data": "unban"}],
-        [{"text": "Начислить очки доверия", "callback_data": "debug_trust_add"}],
-        [{"text": "Снять очки доверия", "callback_data": "debug_trust_remove"}],
-        [{"text": "Нормализация подписок", "callback_data": "debug_normalize"}],
-        [{"text": "Главная", "callback_data": "start"}],
+        [
+            {
+                "text": translate(DEFAULT_LANGUAGE, "buttons.ban_user"),
+                "callback_data": "ban",
+            }
+        ],
+        [
+            {
+                "text": translate(DEFAULT_LANGUAGE, "buttons.unban_user"),
+                "callback_data": "unban",
+            }
+        ],
+        [
+            {
+                "text": translate(DEFAULT_LANGUAGE, "buttons.trust_add"),
+                "callback_data": "debug_trust_add",
+            }
+        ],
+        [
+            {
+                "text": translate(DEFAULT_LANGUAGE, "buttons.trust_remove"),
+                "callback_data": "debug_trust_remove",
+            }
+        ],
+        [
+            {
+                "text": translate(DEFAULT_LANGUAGE, "buttons.normalize_subscriptions"),
+                "callback_data": "debug_normalize",
+            }
+        ],
+        [
+            {
+                "text": translate(DEFAULT_LANGUAGE, "buttons.main"),
+                "callback_data": "start",
+            }
+        ],
     ]
     await smart_answer(event, text, reply_markup=kb(keyboard), delete_origin=True)
 
@@ -4464,8 +5917,15 @@ async def cmd_debug_trust_add(event: CallbackQuery, state: FSMContext):
     await state.set_state(TrustScoreState.waiting_for_user_id)
     await state.update_data(action="add")
 
-    text = "🔧 <b>Начисление очков доверия</b>\n\nВведите ID пользователя, которому нужно начислить очки."
-    keyboard = [[{"text": "Отмена", "callback_data": "cancel"}]]
+    text = translate(DEFAULT_LANGUAGE, "texts.trust_add_prompt")
+    keyboard = [
+        [
+            {
+                "text": translate(DEFAULT_LANGUAGE, "buttons.cancel"),
+                "callback_data": "cancel",
+            }
+        ]
+    ]
     await smart_answer(event, text, reply_markup=kb(keyboard), delete_origin=True)
 
 
@@ -4477,8 +5937,15 @@ async def cmd_debug_trust_remove(event: CallbackQuery, state: FSMContext):
     await state.set_state(TrustScoreState.waiting_for_user_id)
     await state.update_data(action="remove")
 
-    text = "🔧 <b>Снятие очков доверия</b>\n\nВведите ID пользователя, у которого нужно снять очки."
-    keyboard = [[{"text": "Отмена", "callback_data": "cancel"}]]
+    text = translate(DEFAULT_LANGUAGE, "texts.trust_remove_prompt")
+    keyboard = [
+        [
+            {
+                "text": translate(DEFAULT_LANGUAGE, "buttons.cancel"),
+                "callback_data": "cancel",
+            }
+        ]
+    ]
     await smart_answer(event, text, reply_markup=kb(keyboard), delete_origin=True)
 
 
@@ -4491,7 +5958,7 @@ async def process_trust_user_id(event: Message, state: FSMContext):
         return
 
     if not text_value.isdigit():
-        await event.answer("❌ ID пользователя должен быть числом.")
+        await event.answer(translate(DEFAULT_LANGUAGE, "texts.invalid_user_id_number"))
         return
 
     user_id_to_adjust = int(text_value)
@@ -4499,13 +5966,22 @@ async def process_trust_user_id(event: Message, state: FSMContext):
 
     data = await state.get_data()
     action = data.get("action")
-    action_text = "начислить" if action == "add" else "снять"
+    action_text = translate(DEFAULT_LANGUAGE, f"texts.trust_action_{action}")
 
-    text = (
-        f"🔧 <b>{action_text.capitalize()} очков доверия</b>\n\n"
-        f"Введите количество очков, которые нужно {action_text} пользователю {user_id_to_adjust}."
+    text = translate(
+        DEFAULT_LANGUAGE,
+        "texts.trust_amount_prompt",
+        action_text=action_text,
+        user_id=user_id_to_adjust,
     )
-    keyboard = [[{"text": "Отмена", "callback_data": "cancel"}]]
+    keyboard = [
+        [
+            {
+                "text": translate(DEFAULT_LANGUAGE, "buttons.cancel"),
+                "callback_data": "cancel",
+            }
+        ]
+    ]
     await smart_answer(event, text, reply_markup=kb(keyboard), delete_origin=True)
     await state.set_state(TrustScoreState.waiting_for_amount)
 
@@ -4519,18 +5995,22 @@ async def process_trust_amount(event: Message, state: FSMContext):
         return
 
     if not text_value.isdigit():
-        await event.answer(
-            "❌ Количество очков должно быть положительным целым числом."
-        )
+        await event.answer(translate(DEFAULT_LANGUAGE, "texts.trust_amount_invalid"))
         return
 
     amount = int(text_value)
     if amount <= 0:
-        await event.answer("❌ Количество очков должно быть больше нуля.")
+        await event.answer(translate(DEFAULT_LANGUAGE, "texts.trust_amount_positive"))
         return
 
     if amount > TRUST_SCORE_MAX:
-        await event.answer(f"❌ Количество не может превышать {TRUST_SCORE_MAX}.")
+        await event.answer(
+            translate(
+                DEFAULT_LANGUAGE,
+                "texts.trust_amount_exceeds_max",
+                max_amount=TRUST_SCORE_MAX,
+            )
+        )
         return
 
     data = await state.get_data()
@@ -4539,22 +6019,30 @@ async def process_trust_amount(event: Message, state: FSMContext):
 
     if not user_id_to_adjust or action not in {"add", "remove"}:
         await state.clear()
-        await event.answer("❌ Ошибка состояния. Попробуйте снова.")
+        await event.answer(translate(DEFAULT_LANGUAGE, "texts.state_error"))
         return
 
-    # Проверить текущий скор для предупреждения
     current_score = await db.get_trust_score(user_id_to_adjust)
     future_score = current_score + (amount if action == "add" else -amount)
 
     if future_score < TRUST_SCORE_MIN:
         await event.answer(
-            f"❌ Операция приведет к отрицательному балансу. Текущий скор: {current_score}."
+            translate(
+                DEFAULT_LANGUAGE,
+                "texts.trust_operation_negative_balance",
+                current_score=current_score,
+            )
         )
         return
 
     if future_score > TRUST_SCORE_MAX:
         await event.answer(
-            f"❌ Операция приведет к превышению максимума ({TRUST_SCORE_MAX}). Текущий скор: {current_score}."
+            translate(
+                DEFAULT_LANGUAGE,
+                "texts.trust_operation_exceeds_max",
+                max_amount=TRUST_SCORE_MAX,
+                current_score=current_score,
+            )
         )
         return
 
@@ -4566,13 +6054,18 @@ async def process_trust_amount(event: Message, state: FSMContext):
     await state.clear()
 
     if result:
-        action_text = "начислено" if action == "add" else "снято"
-        text = (
-            f"✅ Очки доверия успешно {action_text}.\n\n"
-            f"Пользователь: <code>{user_id_to_adjust}</code>\n"
-            f"Было: <b>{current_score}</b> → стало: <b>{final_score}</b>\n"
-            f"Изменение: <b>{actual_delta:+d}</b>\n"
-            f"Скидка: <b>{calculate_discount_percent(final_score)}%</b>"
+        success_action_text = translate(
+            DEFAULT_LANGUAGE, f"texts.trust_action_success_{action}"
+        )
+        text = translate(
+            DEFAULT_LANGUAGE,
+            "texts.trust_update_success",
+            user_id=user_id_to_adjust,
+            current_score=current_score,
+            final_score=final_score,
+            delta=actual_delta,
+            discount=calculate_discount_percent(final_score),
+            action_text=success_action_text,
         )
         admin_id = event.from_user.id
         admin_username = (event.from_user.username or "").strip()
@@ -4580,22 +6073,37 @@ async def process_trust_amount(event: Message, state: FSMContext):
         if admin_username:
             admin_identity += f", username <code>@{admin_username}</code>"
 
-        admin_action = "начислил" if actual_delta >= 0 else "снял"
+        admin_action = translate(
+            DEFAULT_LANGUAGE,
+            f"texts.trust_admin_action_{action}",
+        )
         try:
             await notify_user(
                 user_id_to_adjust,
-                "<b>Изменение очков доверия</b>\n\n"
-                f"Администратор ({admin_identity}) {admin_action} вам "
-                f"<b>{abs(actual_delta)}</b> очков доверия.\n"
-                f"Было: <b>{current_score}</b> → стало: <b>{final_score}</b>.\n"
-                f"Текущая скидка: <b>{calculate_discount_percent(final_score)}%</b>.",
+                translate(
+                    DEFAULT_LANGUAGE,
+                    "texts.trust_update_notification",
+                    admin_identity=admin_identity,
+                    admin_action=admin_action,
+                    amount=abs(actual_delta),
+                    current_score=current_score,
+                    final_score=final_score,
+                    discount=calculate_discount_percent(final_score),
+                ),
             )
         except Exception:
             pass
     else:
-        text = "❌ Не удалось изменить очки доверия. Проверьте состояние бота и попробуйте снова."
+        text = translate(DEFAULT_LANGUAGE, "texts.trust_update_failed")
 
-    keyboard = [[{"text": "Главная", "callback_data": "start"}]]
+    keyboard = [
+        [
+            {
+                "text": translate(DEFAULT_LANGUAGE, "buttons.main"),
+                "callback_data": "start",
+            }
+        ]
+    ]
     await smart_answer(event, text, reply_markup=kb(keyboard), delete_origin=True)
 
 
@@ -4604,7 +6112,7 @@ async def cmd_debug_normalize(event):
     if not await ensure_admin_access(event, silent=True):
         return
 
-    text = "🔧 <b>Нормализация подписок...</b>"
+    text = translate(DEFAULT_LANGUAGE, "texts.normalize_subscriptions_running")
     await smart_answer(event, text, delete_origin=True)
 
     report = {
@@ -4614,7 +6122,6 @@ async def cmd_debug_normalize(event):
         "errors": 0,
     }
 
-    # 1. Проверить истёкшие подписки и удалить
     db_subs = await db.get_subscribed_user_ids()
     for uid in db_subs:
         state = await get_subscription_state(uid)
@@ -4627,7 +6134,6 @@ async def cmd_debug_normalize(event):
             else:
                 report["errors"] += 1
 
-    # 2. Проверить трафик и удалить превысившие
     for uid in db_subs:
         state = await get_subscription_state(uid)
         if state.get("status") == "traffic_exhausted":
@@ -4639,9 +6145,7 @@ async def cmd_debug_normalize(event):
             else:
                 report["errors"] += 1
 
-    # 3. Восстановить отсутствующие подписки
-    # Получить все уникальные sub_id из БД
-    db_subs = await db.get_subscribed_user_ids()  # Обновить список после очистки
+    db_subs = await db.get_subscribed_user_ids()
     sub_ids = []
     user_by_sub = {}
     expiry_by_sub = {}
@@ -4652,24 +6156,20 @@ async def cmd_debug_normalize(event):
             if sub_id:
                 sub_ids.append(sub_id)
                 user_by_sub[sub_id] = user
-                # Получить expiry из существующих клиентов
                 state = await get_subscription_state(uid)
                 if state.get("max_expiry"):
                     expiry_by_sub[sub_id] = state["max_expiry"]
 
-    # Получить все enabled inbound
     inbounds_data = await panel.get_inbounds()
     if inbounds_data and inbounds_data.get("success"):
         enabled_inbounds = [
             i for i in inbounds_data.get("obj", []) if i.get("enable", False)
         ]
 
-        # Для каждого inbound проверить наличие всех sub_id
         for inbound in enabled_inbounds:
             inbound_id = inbound.get("id")
             client_stats = inbound.get("clientStats", [])
 
-            # Собрать set существующих subId в этом inbound
             existing_sub_ids = {
                 normalize_sub_id(c.get("subId", ""))
                 for c in client_stats
@@ -4678,7 +6178,6 @@ async def cmd_debug_normalize(event):
 
             for sub_id in sub_ids:
                 if sub_id not in existing_sub_ids:
-                    # Нужно добавить клиента в этот inbound
                     user = user_by_sub.get(sub_id)
                     if not user:
                         continue
@@ -4692,26 +6191,22 @@ async def cmd_debug_normalize(event):
                     ):
                         continue
 
-                    # Найти тариф
                     tariff = get_by_name(plan_text)
                     if not tariff and isinstance(plan_text, str):
                         base_plan_text = plan_text.split(" (", 1)[0].strip()
                         if base_plan_text:
                             tariff = get_by_name(base_plan_text)
 
-                    # Рассчитать expiry
                     bonus_days = user.get("bonus_days_pending", 0)
                     if sub_id in expiry_by_sub:
                         expiry_ms = expiry_by_sub[sub_id]
                     else:
-                        # Если нет существующих, используем дни из БД
                         duration_days = (
                             to_int(tariff.get("duration_days"), 30) if tariff else 30
                         )
                         total_days = duration_days + bonus_days
                         expiry_ms = int((time.time() + total_days * 86400) * 1000)
 
-                    # Создать клиента в конкретном inbound
                     try:
                         client_data = await panel.create_client_in_inbound(
                             inbound_id=inbound_id,
@@ -4731,21 +6226,26 @@ async def cmd_debug_normalize(event):
                             f"Exception recovering {sub_id} in {inbound_id}: {e}"
                         )
 
-    # Отправить отчёт админу
-    report_text = (
-        f"🔧 <b>Отчёт нормализации подписок</b>\n\n"
-        f"Удалено истёкших: {report['expired_cleaned']}\n"
-        f"Удалено превысивших трафик: {report['traffic_exceeded_cleaned']}\n"
-        f"Восстановлено отсутствующих: {report['missing_recovered']}\n"
-        f"Ошибок: {report['errors']}"
+    report_text = translate(
+        DEFAULT_LANGUAGE,
+        "texts.normalize_subscriptions_report",
+        expired_cleaned=report["expired_cleaned"],
+        traffic_exceeded_cleaned=report["traffic_exceeded_cleaned"],
+        missing_recovered=report["missing_recovered"],
+        errors=report["errors"],
     )
 
     if all(v == 0 for v in report.values()):
-        report_text = (
-            "✅ <b>Нормализация завершена</b>\n\nПроблем не найдено, всё в порядке."
-        )
+        report_text = translate(DEFAULT_LANGUAGE, "texts.normalize_subscriptions_ok")
 
-    keyboard = [[{"text": "Главная", "callback_data": "start"}]]
+    keyboard = [
+        [
+            {
+                "text": translate(DEFAULT_LANGUAGE, "buttons.main"),
+                "callback_data": "start",
+            }
+        ]
+    ]
     await smart_answer(
         event, report_text, reply_markup=kb(keyboard), delete_origin=True
     )
@@ -4763,7 +6263,7 @@ async def cmd_pay_await(event):
     if not pending:
         await smart_answer(
             event,
-            "🕒 <b>Нет пользователей, ожидающих подтверждения платежа</b>",
+            translate(DEFAULT_LANGUAGE, "texts.pay_await_empty"),
             reply_markup=main_menu_keyboard(),
             delete_origin=True,
         )
@@ -4771,7 +6271,7 @@ async def cmd_pay_await(event):
 
     await smart_answer(
         event,
-        "🕒 <b>Пользователи, ожидающие подтверждения платежа:</b>",
+        translate(DEFAULT_LANGUAGE, "texts.pay_await_title"),
         delete_origin=True,
     )
 
@@ -4804,9 +6304,14 @@ async def cmd_pay_await_accept(event: CallbackQuery):
             event,
             payment_id,
             "accept",
-            error_message="Некорректный user_id во время подтверждения платежа",
+            error_message=translate(
+                DEFAULT_LANGUAGE, "texts.invalid_payment_user_error"
+            ),
         )
-        await event.answer("❌ Некорректный пользователь в платеже", show_alert=True)
+        await event.answer(
+            translate(DEFAULT_LANGUAGE, "texts.invalid_payment_user_alert"),
+            show_alert=True,
+        )
         return
 
     plan_type = str(payment.get("plan_type", "catalog"))
@@ -4821,9 +6326,17 @@ async def cmd_pay_await_accept(event: CallbackQuery):
             event,
             payment_id,
             "accept",
-            error_message=error or "Тариф не найден во время подтверждения платежа",
+            error_message=error
+            or translate(DEFAULT_LANGUAGE, "texts.plan_not_found_during_payment"),
         )
-        await event.answer(f"❌ {error or 'Тариф не найден'}", show_alert=True)
+        await event.answer(
+            translate(
+                DEFAULT_LANGUAGE,
+                "texts.plan_not_found_alert",
+                error=error or translate(DEFAULT_LANGUAGE, "texts.plan_not_found"),
+            ),
+            show_alert=True,
+        )
         return
 
     plan_name = str(payment.get("plan_name") or "").strip()
@@ -4839,11 +6352,21 @@ async def cmd_pay_await_accept(event: CallbackQuery):
         bonus_days_for_user = Config.REF_BONUS_DAYS
 
     trust_before_payment = await db.get_trust_score(user_id)
-    vpn_url = await create_subscription(
-        user_id,
-        plan,
-        extra_days=bonus_days_for_user,
-    )
+    payment_state = await get_subscription_state(user_id)
+    if payment_state.get("status") == "active" and is_expiring_soon(
+        payment_state, days=3
+    ):
+        vpn_url = await renew_subscription(
+            user_id,
+            plan,
+            extra_days=bonus_days_for_user,
+        )
+    else:
+        vpn_url = await create_subscription(
+            user_id,
+            plan,
+            extra_days=bonus_days_for_user,
+        )
 
     if vpn_url:
         trust_after_payment = await db.get_trust_score(user_id)
@@ -4859,7 +6382,6 @@ async def cmd_pay_await_accept(event: CallbackQuery):
         if not finalized:
             return
 
-        # Дополнительная защита: проверить что платеж действительно в финальном статусе
         is_really_finalized = await verify_payment_final_status(payment_id, "accepted")
         if not is_really_finalized:
             logger.error(
@@ -4867,35 +6389,41 @@ async def cmd_pay_await_accept(event: CallbackQuery):
                 f"Это может указывать на race condition. Подписка уже выдана user_id={user_id}"
             )
             await event.answer(
-                "⚠️ Платеж обработан, но возникло предупреждение. Проверьте статус платежа.",
+                translate(DEFAULT_LANGUAGE, "texts.payment_processed_warning"),
                 show_alert=True,
             )
             return
 
         bonus_text = ""
         if bonus_days_for_user > 0:
-            bonus_text = f"\nБонус: <b>+{bonus_days_for_user} дней</b>"
+            bonus_text = translate(
+                DEFAULT_LANGUAGE,
+                "texts.payment_bonus_line",
+                bonus_days=format_duration(bonus_days_for_user),
+            )
 
         try:
             await notify_user(
                 user_id,
-                "✅ <b>Ваш платеж подтвержден!</b>\n\n"
-                f"Тариф: <b>{plan_name}</b>\n"
-                f"IP-адреса: <b>до {plan.get('ip_limit', 0)}</b>\n"
-                f"Трафик: <b>{format_traffic(plan.get('traffic_gb', 0))}</b>\n"
-                f"Локации: <b>{format_servers(plan.get('servers'))}</b>\n"
-                f"Срок: <b>{format_duration(int(plan.get('duration_days', 30)) + bonus_days_for_user)}</b>"
-                f"{bonus_text}\n"
-                f"{trust_change_line}\n\n"
-                f"URL для подключения:\n<code>{vpn_url}</code>\n\n"
-                "Спасибо за покупку! 🎉",
+                translate(
+                    DEFAULT_LANGUAGE,
+                    "texts.payment_accepted_notification",
+                    plan_name=plan_name,
+                    ip_limit=plan.get("ip_limit", 0),
+                    traffic=format_traffic(plan.get("traffic_gb", 0)),
+                    servers=format_servers(plan.get("servers")),
+                    duration=format_duration(
+                        int(plan.get("duration_days", 30)) + bonus_days_for_user
+                    ),
+                    bonus_text=bonus_text,
+                    trust_change_line=trust_change_line,
+                    vpn_url=vpn_url,
+                ),
             )
         except Exception:
             pass
 
-        # Выдать бонус рефереру только если он не был выдан (atomic check)
         if ref_by and not ref_rewarded:
-            # Перепроверить что ref_rewarded еще false перед выдачей бонуса
             fresh_user_data = await db.get_user(user_id)
             if not fresh_user_data.get("ref_rewarded"):
                 await reward_referrer(ref_by, Config.REF_BONUS_DAYS)
@@ -4910,17 +6438,32 @@ async def cmd_pay_await_accept(event: CallbackQuery):
                     f"ref_rewarded уже установлен для user_id={user_id}, пропущена выдача бонуса рефереру"
                 )
 
-        await event.answer(f"✅ Платеж {payment_id} подтвержден!", show_alert=True)
-        await append_payment_decision_label(event.message, "✅ <b>ПОДТВЕРЖДЕНО</b>")
+        await event.answer(
+            translate(
+                DEFAULT_LANGUAGE, "texts.payment_accept_alert", payment_id=payment_id
+            ),
+            show_alert=True,
+        )
+        await append_payment_decision_label(
+            event.message,
+            translate(DEFAULT_LANGUAGE, "texts.payment_decision_accepted"),
+        )
     else:
         await rollback_claimed_payment(
             event,
             payment_id,
             "accept",
-            error_message="Не удалось создать VPN-подписку",
+            error_message=translate(
+                DEFAULT_LANGUAGE, "texts.vpn_subscription_create_failed"
+            ),
         )
         await event.answer(
-            f"❌ Ошибка создания VPN для платежа {payment_id}", show_alert=True
+            translate(
+                DEFAULT_LANGUAGE,
+                "texts.payment_vpn_create_error",
+                payment_id=payment_id,
+            ),
+            show_alert=True,
         )
 
 
@@ -4941,7 +6484,6 @@ async def cmd_pay_await_reject(event: CallbackQuery):
     if not finalized:
         return
 
-    # Дополнительная защита: проверить что платеж действительно в финальном статусе
     is_really_finalized = await verify_payment_final_status(payment_id, "rejected")
     if not is_really_finalized:
         logger.error(
@@ -4949,7 +6491,7 @@ async def cmd_pay_await_reject(event: CallbackQuery):
             f"Это может указывать на race condition."
         )
         await event.answer(
-            "⚠️ Платеж обработан, но возникло предупреждение. Проверьте статус платежа.",
+            translate(DEFAULT_LANGUAGE, "texts.payment_processed_warning"),
             show_alert=True,
         )
 
@@ -4977,20 +6519,28 @@ async def cmd_pay_await_reject(event: CallbackQuery):
         try:
             await notify_user(
                 user_id,
-                "❌ <b>Ваш платеж отклонен!</b>\n\n"
-                "Пожалуйста, проверьте:\n"
-                "1. Правильность суммы платежа\n"
-                "2. Актуальность данных карты\n"
-                "3. Успешность перевода в банковском приложении\n\n"
-                f"{build_trust_change_line(trust_delta_reject, trust_before_reject, trust_after_reject)}\n\n"
-                "Если вы уверены, что все сделали правильно, свяжитесь с поддержкой.",
+                translate(
+                    DEFAULT_LANGUAGE,
+                    "texts.payment_rejected_notification",
+                    trust_change_line=build_trust_change_line(
+                        trust_delta_reject, trust_before_reject, trust_after_reject
+                    ),
+                ),
                 reply_markup=support_keyboard(include_main=True),
             )
         except Exception:
             pass
 
-    await event.answer(f"❌ Платеж {payment_id} отклонен!", show_alert=True)
-    await append_payment_decision_label(event.message, "❌ <b>ОТКЛОНЕНО</b>")
+    await event.answer(
+        translate(
+            DEFAULT_LANGUAGE, "texts.payment_reject_alert", payment_id=payment_id
+        ),
+        show_alert=True,
+    )
+    await append_payment_decision_label(
+        event.message,
+        translate(DEFAULT_LANGUAGE, "texts.payment_decision_rejected"),
+    )
 
 
 # --- Запуск ---
@@ -5025,7 +6575,11 @@ async def main():
         BOT_USERNAME = me.username or ""
 
         for admin_id in Config.ADMIN_USER_IDS:
-            await safe_send_message(bot, admin_id, "🟢 <b>Бот успешно запущен!</b>")
+            await safe_send_message(
+                bot,
+                admin_id,
+                translate(DEFAULT_LANGUAGE, "texts.bot_started"),
+            )
 
         background_tasks.append(asyncio.create_task(check_expired_subscriptions()))
         background_tasks.append(asyncio.create_task(cleanup_old_payments()))
@@ -5036,7 +6590,6 @@ async def main():
     except (asyncio.CancelledError, KeyboardInterrupt):
         logger.info("Остановка бота по запросу пользователя")
     finally:
-        # Сначала остановить polling
         if polling_task and not polling_task.done():
             polling_task.cancel()
             try:
@@ -5046,12 +6599,10 @@ async def main():
             except asyncio.TimeoutError:
                 logger.warning("Polling task не остановилась в течение 2 секунд")
 
-        # Отменить только фоновые задачи
         for task in background_tasks:
             if not task.done():
                 task.cancel()
 
-        # Дать время на выполнение отмены
         if background_tasks:
             try:
                 await asyncio.wait_for(
@@ -5063,14 +6614,16 @@ async def main():
                     "Некоторые фоновые задачи не завершились в течение 3 секунд"
                 )
 
-        # Выполнить cleanup
         try:
             for admin_id in Config.ADMIN_USER_IDS:
-                await safe_send_message(bot, admin_id, "🔴 <b>Бот остановлен!</b>")
+                await safe_send_message(
+                    bot,
+                    admin_id,
+                    translate(DEFAULT_LANGUAGE, "texts.bot_stopped"),
+                )
         except Exception as e:
             logger.error(f"Ошибка при отправке уведомления админам: {e}")
 
-        # Освободить зависшие платежи
         try:
             await cleanup_stale_payments()
         except Exception as e:
