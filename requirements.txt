@@ -5,3 +5,4 @@ aiofiles>=25.1.0
 python-dotenv>=1.2.2
 paramiko>=5.0.0
 urllib3>=2.7.0
+typing-extensions>=4.15.0
