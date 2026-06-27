@@ -1,5 +1,4 @@
-__pycache__/
+logs/
 data/users.db
 data/await_payments.json
-logs/
 .env
